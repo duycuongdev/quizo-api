@@ -17,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.database import Base, get_db
 from app.core.rate_limit import limiter
+from app.db.seed import seed_database
 from app.main import create_app
 
 
@@ -36,6 +37,15 @@ async def db_engine():
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    session_factory = async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+    )
+    async with session_factory() as session:
+        await seed_database(session)
 
     yield engine
 
