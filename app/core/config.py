@@ -37,6 +37,17 @@ class Settings(BaseSettings):
     RATE_LIMIT_AUTH: str = "10/minute"
     RATE_LIMIT_AI: str = "5/minute"
 
+    # Email & SMTP Settings (Brevo)
+    SMTP_SERVER: str = "smtp-relay.brevo.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = "noreply@quizo.app"
+    SMTP_FROM_NAME: str = "Quizo"
+    FRONTEND_URL: str = "http://localhost:3000"
+    EMAIL_VERIFICATION_EXPIRE_HOURS: int = 24
+    PASSWORD_RESET_EXPIRE_MINUTES: int = 30
+
     @field_validator("DEBUG", mode="before")
     @classmethod
     def parse_debug_bool(cls, value: object) -> bool:

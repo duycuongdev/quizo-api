@@ -77,6 +77,33 @@ def create_refresh_token(subject: str, jti: str | None = None) -> tuple[str, str
     return encoded, token_jti, expire
 
 
+def create_email_verification_token(subject: str, email: str) -> str:
+    now = datetime.now(UTC)
+    expire = now + timedelta(hours=settings.EMAIL_VERIFICATION_EXPIRE_HOURS)
+    payload: dict[str, Any] = {
+        "sub": str(subject),
+        "email": email,
+        "type": "email_verification",
+        "jti": str(uuid4()),
+        "iat": int(now.timestamp()),
+        "exp": int(expire.timestamp()),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def create_password_reset_token(subject: str) -> str:
+    now = datetime.now(UTC)
+    expire = now + timedelta(minutes=settings.PASSWORD_RESET_EXPIRE_MINUTES)
+    payload: dict[str, Any] = {
+        "sub": str(subject),
+        "type": "password_reset",
+        "jti": str(uuid4()),
+        "iat": int(now.timestamp()),
+        "exp": int(expire.timestamp()),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
 def decode_token(token: str, expected_type: str) -> dict[str, Any]:
     try:
         payload = jwt.decode(

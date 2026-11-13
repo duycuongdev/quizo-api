@@ -7,13 +7,17 @@ from app.core.database import get_db
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.auth import (
+    ForgotPasswordRequest,
     GoogleAuthRequest,
     LoginRequest,
     LogoutRequest,
     RefreshRequest,
     RegisterRequest,
+    ResendVerificationRequest,
+    ResetPasswordRequest,
     TokenResponse,
     UserResponse,
+    VerifyEmailRequest,
 )
 from app.services import auth_service
 
@@ -106,3 +110,60 @@ async def logout(
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
     return UserResponse.model_validate(current_user)
+
+
+@router.post("/verify-email")
+@limiter.limit(settings.RATE_LIMIT_AUTH)
+async def verify_email(
+    request: Request,
+    payload: VerifyEmailRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    user = await auth_service.verify_email(db=db, token=payload.token)
+    return {
+        "detail": "Email đã được xác nhận thành công.",
+        "user": UserResponse.model_validate(user),
+    }
+
+
+@router.post("/resend-verification")
+@limiter.limit("5/minute")
+async def resend_verification(
+    request: Request,
+    payload: ResendVerificationRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    await auth_service.resend_verification_email(db=db, email=str(payload.email))
+    return {
+        "detail": "Nếu email tồn tại và chưa được kích hoạt, hệ thống đã gửi thư xác nhận mới."
+    }
+
+
+@router.post("/forgot-password")
+@limiter.limit("5/minute")
+async def forgot_password(
+    request: Request,
+    payload: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    await auth_service.request_password_reset(db=db, email=str(payload.email))
+    return {
+        "detail": "Nếu email tồn tại trong hệ thống, bạn sẽ nhận được hướng dẫn đặt lại mật khẩu trong vài phút."
+    }
+
+
+@router.post("/reset-password")
+@limiter.limit("5/minute")
+async def reset_password(
+    request: Request,
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    await auth_service.reset_password(
+        db=db,
+        token=payload.token,
+        new_password=payload.new_password,
+    )
+    return {
+        "detail": "Đặt lại mật khẩu thành công. Vui lòng đăng nhập bằng mật khẩu mới."
+    }
