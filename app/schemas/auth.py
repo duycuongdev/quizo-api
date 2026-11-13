@@ -46,6 +46,29 @@ class LogoutRequest(BaseModel):
     refresh_token: str | None = None
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=10)
+    new_password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def check_password_strength(cls, value: str) -> str:
+        validate_password_strength(value)
+        return value
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=10)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -55,6 +78,7 @@ class UserResponse(BaseModel):
     auth_provider: str
     avatar_url: str | None = None
     is_active: bool
+    is_verified: bool = False
     created_at: datetime
 
 

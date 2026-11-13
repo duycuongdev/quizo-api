@@ -205,3 +205,130 @@ async def test_auth_rate_limiting(client: AsyncClient) -> None:
     finally:
         limiter.enabled = False
         limiter.reset()
+
+
+@pytest.mark.asyncio
+async def test_email_verification_flow(client: AsyncClient) -> None:
+    from app.core.security import create_email_verification_token
+
+    # Register user
+    reg = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "charlie@example.com",
+            "password": "Password1234",
+            "full_name": "Charlie Nguyen",
+        },
+    )
+    assert reg.status_code == 201
+    user_data = reg.json()["user"]
+    assert user_data["is_verified"] is False
+    user_id = user_data["id"]
+
+    # Verify with malformed token
+    bad_res = await client.post(
+        "/api/v1/auth/verify-email",
+        json={"token": "invalid.jwt.token"},
+    )
+    assert bad_res.status_code == 400
+
+    # Resend verification email
+    resend = await client.post(
+        "/api/v1/auth/resend-verification",
+        json={"email": "charlie@example.com"},
+    )
+    assert resend.status_code == 200
+
+    # Verify with legitimate token
+    valid_token = create_email_verification_token(user_id, "charlie@example.com")
+    verify_res = await client.post(
+        "/api/v1/auth/verify-email",
+        json={"token": valid_token},
+    )
+    assert verify_res.status_code == 200
+    assert verify_res.json()["user"]["is_verified"] is True
+
+    # Verify again is idempotent
+    verify_again = await client.post(
+        "/api/v1/auth/verify-email",
+        json={"token": valid_token},
+    )
+    assert verify_again.status_code == 200
+    assert verify_again.json()["user"]["is_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_password_reset_flow(client: AsyncClient, db_session: AsyncSession) -> None:
+    from app.core.security import create_password_reset_token, hash_token
+    from app.models.user import User
+    from uuid import UUID
+    from datetime import UTC, datetime, timedelta
+
+    # Register user
+    reg = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "david@example.com",
+            "password": "OldPassword123",
+            "full_name": "David Tran",
+        },
+    )
+    assert reg.status_code == 201
+    user_id = reg.json()["user"]["id"]
+
+    # Anti-enumeration for unknown email
+    unknown_res = await client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": "unknown@example.com"},
+    )
+    assert unknown_res.status_code == 200
+
+    # Request password reset for real user
+    forgot_res = await client.post(
+        "/api/v1/auth/forgot-password",
+        json={"email": "david@example.com"},
+    )
+    assert forgot_res.status_code == 200
+
+    # Generate test reset token and update user hash
+    reset_token = create_password_reset_token(user_id)
+    user = await db_session.get(User, UUID(user_id))
+    assert user is not None
+    user.password_reset_token_hash = hash_token(reset_token)
+    user.password_reset_expires_at = datetime.now(UTC) + timedelta(minutes=30)
+    await db_session.commit()
+
+    # Reset with weak password
+    weak_reset = await client.post(
+        "/api/v1/auth/reset-password",
+        json={"token": reset_token, "new_password": "weak"},
+    )
+    assert weak_reset.status_code == 422
+
+    # Reset with valid new password
+    success_reset = await client.post(
+        "/api/v1/auth/reset-password",
+        json={"token": reset_token, "new_password": "NewStrongPassword123"},
+    )
+    assert success_reset.status_code == 200
+
+    # Old password no longer works
+    old_login = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "david@example.com", "password": "OldPassword123"},
+    )
+    assert old_login.status_code == 401
+
+    # New password logs in successfully
+    new_login = await client.post(
+        "/api/v1/auth/login",
+        json={"email": "david@example.com", "password": "NewStrongPassword123"},
+    )
+    assert new_login.status_code == 200
+
+    # Token replay fails (single-use token protection)
+    replay_reset = await client.post(
+        "/api/v1/auth/reset-password",
+        json={"token": reset_token, "new_password": "AnotherPassword456"},
+    )
+    assert replay_reset.status_code == 400
