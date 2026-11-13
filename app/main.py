@@ -11,12 +11,43 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.middleware import SecurityHeadersMiddleware, unhandled_exception_handler
 from app.core.rate_limit import limiter, rate_limit_exceeded_handler
+from sqlalchemy import text
+
+
+async def _migrate_users_schema(conn) -> None:
+    try:
+        # SQLite schema check
+        res = await conn.execute(text("PRAGMA table_info(users)"))
+        cols = {row[1] for row in res.fetchall()}
+        if cols:
+            if "is_verified" not in cols:
+                await conn.execute(text("ALTER TABLE users ADD COLUMN is_verified BOOLEAN NOT NULL DEFAULT 0"))
+            if "password_reset_token_hash" not in cols:
+                await conn.execute(text("ALTER TABLE users ADD COLUMN password_reset_token_hash VARCHAR(128)"))
+            if "password_reset_expires_at" not in cols:
+                await conn.execute(text("ALTER TABLE users ADD COLUMN password_reset_expires_at TIMESTAMP"))
+            # Auto-verify existing Google users if not already marked
+            await conn.execute(
+                text("UPDATE users SET is_verified = 1 WHERE auth_provider = 'google' AND is_verified = 0")
+            )
+    except Exception:
+        # PostgreSQL fallback
+        try:
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT FALSE"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token_hash VARCHAR(128)"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMP WITH TIME ZONE"))
+            await conn.execute(
+                text("UPDATE users SET is_verified = TRUE WHERE auth_provider = 'google' AND is_verified = FALSE")
+            )
+        except Exception:
+            pass
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _migrate_users_schema(conn)
     # Seed initial AI Engineer categories/questions idempotently if available
     try:
         from app.db.seed import seed_database

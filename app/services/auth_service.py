@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -12,13 +12,17 @@ from app.core.config import settings
 from app.core.security import (
     TokenVerificationError,
     create_access_token,
+    create_email_verification_token,
+    create_password_reset_token,
     create_refresh_token,
     decode_token,
     hash_password,
     hash_token,
+    validate_password_strength,
     verify_password,
 )
 from app.models.user import RefreshToken, User
+from app.services import email_service
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -61,9 +65,21 @@ async def register_user(
         full_name=full_name.strip(),
         hashed_password=hash_password(password),
         auth_provider="local",
+        is_verified=False,
     )
     db.add(user)
     await db.flush()
+
+    # Generate email verification token and send verification email in background
+    verify_token = create_email_verification_token(str(user.id), user.email)
+    asyncio.create_task(
+        email_service.send_verification_email(
+            email=user.email,
+            full_name=user.full_name,
+            token=verify_token,
+        )
+    )
+
     access_token, refresh_token = await _issue_token_pair(db, user)
     return user, access_token, refresh_token
 
@@ -139,6 +155,7 @@ async def authenticate_google_user(
         user = await db.scalar(select(User).where(User.email == email))
         if user is not None:
             user.google_sub = google_sub
+            user.is_verified = True
             if not user.avatar_url and idinfo.get("picture"):
                 user.avatar_url = str(idinfo["picture"])[:500]
         else:
@@ -151,6 +168,7 @@ async def authenticate_google_user(
                 auth_provider="google",
                 google_sub=google_sub,
                 avatar_url=avatar_url,
+                is_verified=True,
             )
             db.add(user)
             await db.flush()
@@ -266,4 +284,132 @@ async def revoke_refresh_tokens(
             )
             .values(revoked=True, revoked_at=now)
         )
+    await db.commit()
+
+
+async def verify_email(db: AsyncSession, token: str) -> User:
+    try:
+        payload = decode_token(token, expected_type="email_verification")
+    except TokenVerificationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Liên kết xác nhận không hợp lệ hoặc đã hết hạn.",
+        ) from exc
+
+    user_id_str = payload.get("sub")
+    try:
+        user_id = UUID(str(user_id_str))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mã xác thực không hợp lệ.",
+        ) from exc
+
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Tài khoản không tồn tại.",
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tài khoản đã bị vô hiệu hóa.",
+        )
+
+    if not user.is_verified:
+        user.is_verified = True
+        await db.commit()
+        await db.refresh(user)
+
+    return user
+
+
+async def resend_verification_email(db: AsyncSession, email: str) -> None:
+    normalized_email = email.strip().lower()
+    user = await db.scalar(select(User).where(User.email == normalized_email))
+    if user is None or not user.is_active or user.is_verified:
+        # Anti-enumeration & idempotency: return silently
+        return
+
+    verify_token = create_email_verification_token(str(user.id), user.email)
+    asyncio.create_task(
+        email_service.send_verification_email(
+            email=user.email,
+            full_name=user.full_name,
+            token=verify_token,
+        )
+    )
+
+
+async def request_password_reset(db: AsyncSession, email: str) -> None:
+    normalized_email = email.strip().lower()
+    user = await db.scalar(select(User).where(User.email == normalized_email))
+    if user is None or not user.is_active or user.auth_provider != "local":
+        # Anti-enumeration: return silently
+        return
+
+    reset_token = create_password_reset_token(str(user.id))
+    user.password_reset_token_hash = hash_token(reset_token)
+    user.password_reset_expires_at = datetime.now(UTC) + timedelta(
+        minutes=settings.PASSWORD_RESET_EXPIRE_MINUTES
+    )
+    await db.commit()
+
+    asyncio.create_task(
+        email_service.send_password_reset_email(
+            email=user.email,
+            full_name=user.full_name,
+            token=reset_token,
+        )
+    )
+
+
+async def reset_password(db: AsyncSession, token: str, new_password: str) -> None:
+    try:
+        payload = decode_token(token, expected_type="password_reset")
+    except TokenVerificationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Liên kết đặt lại mật khẩu không hợp lệ hoặc đã hết hạn.",
+        ) from exc
+
+    user_id_str = payload.get("sub")
+    try:
+        user_id = UUID(str(user_id_str))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mã đặt lại mật khẩu không hợp lệ.",
+        ) from exc
+
+    user = await db.get(User, user_id)
+    if user is None or not user.is_active or user.auth_provider != "local":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Yêu cầu đặt lại mật khẩu không hợp lệ.",
+        )
+
+    # Check token hash and expiration in DB (ensures single use)
+    token_h = hash_token(token)
+    now = datetime.now(UTC)
+    if not user.password_reset_token_hash or user.password_reset_token_hash != token_h:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Liên kết đặt lại mật khẩu này đã được sử dụng hoặc không còn hiệu lực.",
+        )
+
+    if user.password_reset_expires_at and _ensure_utc(user.password_reset_expires_at) < now:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Liên kết đặt lại mật khẩu đã hết hạn.",
+        )
+
+    validate_password_strength(new_password)
+    user.hashed_password = hash_password(new_password)
+    user.password_reset_token_hash = None
+    user.password_reset_expires_at = None
+
+    # Revoke all refresh tokens for this user on password change
+    await revoke_refresh_tokens(db=db, user_id=user.id)
     await db.commit()
