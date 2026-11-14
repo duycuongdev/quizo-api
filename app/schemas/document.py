@@ -85,7 +85,7 @@ class DocumentAnalyzeResponse(BaseModel):
 class TopicGenerateRequest(BaseModel):
     document_id: UUID
     selected_topic_ids: list[str] = Field(default_factory=lambda: ["all"])
-    density: Literal["focused", "comprehensive"] = "comprehensive"
+    density: Literal["focused", "comprehensive", "exhaustive"] = "exhaustive"
     difficulty: Literal["easy", "medium", "hard", "mixed"] = "mixed"
     language: Literal["vi", "en"] = "vi"
     category_id: UUID | None = None

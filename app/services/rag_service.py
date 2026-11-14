@@ -198,29 +198,44 @@ def _call_gemini_extract_topics_sync(doc_text: str) -> tuple[str, list[TopicItem
         "- id: Chuỗi số thứ tự '1', '2', '3',...\n"
         "- title: Tên tiêu đề ngắn gọn (ví dụ: 'Kiến trúc Backend & MongoDB', 'Authentication & JWT', v.v.).\n"
         "- summary: Tóm tắt 1-2 câu về phạm vi kiến thức trong phần này.\n"
-        "- key_points: 2 đến 4 ý kiến thức chuyên môn cốt lõi được đề cập.\n"
+        "- key_points: Liệt kê đầy đủ mọi điểm kiến thức, khái niệm, công nghệ, tham số, cơ chế, đoạn mã, bug stories và câu hỏi phỏng vấn trong phần này (liệt kê toàn bộ các ý độc lập để phục vụ quét cạn câu hỏi).\n"
         "- is_meta: boolean (true nếu là kế hoạch/lộ trình ôn tập, false nếu là kiến thức kỹ thuật)."
     )
     prompt = (
         "Hãy phân tích và trích xuất danh sách các đầu mục kiến thức cần học trong tài liệu dưới đây:\n\n"
         f"<DOCUMENT>\n{doc_text[:40000]}\n</DOCUMENT>"
     )
-    response = client.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_schema=_DocumentOutlineOutput,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-            temperature=0.2,
-        ),
-    )
-    if response.parsed and isinstance(response.parsed, _DocumentOutlineOutput):
-        return response.parsed.document_title, response.parsed.topics
-    if response.text:
-        parsed = _DocumentOutlineOutput.model_validate_json(response.text)
-        return parsed.document_title, parsed.topics
+
+    models = [settings.GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.5-flash"]
+    seen = set()
+    candidate_models = [m for m in models if not (m in seen or seen.add(m))]
+
+    last_exc = None
+    import time
+    for model_name in candidate_models:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                        response_schema=_DocumentOutlineOutput,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                        temperature=0.2,
+                    ),
+                )
+                if response.parsed and isinstance(response.parsed, _DocumentOutlineOutput):
+                    return response.parsed.document_title, response.parsed.topics
+                if response.text:
+                    parsed = _DocumentOutlineOutput.model_validate_json(response.text)
+                    return parsed.document_title, parsed.topics
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(1.0)
+    if last_exc:
+        logger.warning("Extract topics fallback error: %s", last_exc)
     return "Tài liệu học tập", []
 
 
@@ -247,12 +262,11 @@ async def _generate_single_topic_questions(
     client: genai.Client,
     doc_text: str,
     topic: TopicItem,
-    q_count: int,
     difficulty: str,
     language: str,
     category_name: str | None,
 ) -> list[_GeminiQuestion]:
-    """Generate high-depth substantive questions for a single topic using Gemini."""
+    """Generate exhaustive substantive questions for a single topic until all knowledge is covered."""
     lang_instruction = (
         "Soạn câu hỏi và đáp án bằng Tiếng Việt tự nhiên, chuẩn mực giáo dục. "
         "Giữ nguyên thuật ngữ kỹ thuật tiếng Anh (REST, JWT, React, Docker, Socket.IO, v.v.)."
@@ -270,22 +284,23 @@ async def _generate_single_topic_questions(
     points_str = "; ".join(topic.key_points) if topic.key_points else ""
 
     system_instruction = (
-        "Bạn là một chuyên gia kỹ thuật và sư phạm tạo câu hỏi trắc nghiệm chuyên sâu.\n"
-        "QUY TẮC CỐT LÕI BẮT BUỘC:\n"
-        "1. CHỈ HỎI VỀ KIẾN THỨC CHUYÊN MÔN THỰC CHẤT: Kiến trúc hệ thống, cơ chế hoạt động, công nghệ, "
-        "xử lý ngoại lệ, nguyên nhân & giải pháp sửa lỗi (bug stories), thiết kế database, tối ưu hiệu năng, mã code.\n"
-        "2. TUYỆT ĐỐI NGHIÊM CẤM sinh câu hỏi về các nội dung meta như: Lộ trình ôn tập (ví dụ: ngày 1 làm gì, ngày 2 làm gì), "
-        "kế hoạch học tập, thời gian biểu, mục lục, tác giả, hoặc hướng dẫn đọc tài liệu.\n"
-        "3. BÁM SÁT TÀI LIỆU (GROUNDING): Toàn bộ câu hỏi, đáp án và giải thích phải bám sát 100% vào nội dung tài liệu nguồn.\n"
-        "4. DẪN CHỨNG (source_reference): Ghi rõ câu hỏi lấy từ mục/đoạn nào trong tài liệu.\n"
-        "5. CẤU TRÚC: Mỗi câu đúng 4 đáp án, duy nhất 1 đáp án có is_correct=true."
+        "Bạn là một chuyên gia kỹ thuật và sư phạm cao cấp chuyên thiết kế bài kiểm tra trắc nghiệm chuyên sâu.\n"
+        "NGUYÊN TẮC QUÉT CẠN KIẾN THỨC (EXHAUSTIVE KNOWLEDGE EXTRACTION):\n"
+        "1. NHIỆM VỤ: Khai thác TRIỆT ĐỂ và TOÀN DIỆN MỌI ĐIỂM KIẾN THỨC có trong tài liệu thuộc chủ đề được giao.\n"
+        "2. KHÔNG GIỚI HẠN SỐ CÂU HỎI: Với MỖI khái niệm, cơ chế hoạt động, quyết định kiến trúc, thông số cấu hình, đoạn mã code, bài học kinh nghiệm, giải pháp xử lý lỗi hoặc bug story độc lập trong tài liệu, BẮT BUỘC tạo 1 câu hỏi trắc nghiệm tương ứng.\n"
+        "3. SINH ĐẾN KHI HẾT KIẾN THỨC: Tiếp tục sinh câu hỏi cho đến khi toàn bộ lượng kiến thức chuyên môn trong tài liệu của chủ đề này được bao quát 100%, tuyệt đối không bỏ sót bất kỳ chi tiết hay bug story nào.\n"
+        "4. BÁM SÁT TÀI LIỆU NGUỒN 100%: Toàn bộ câu hỏi, đáp án đúng và giải thích chi tiết phải bám sát 100% vào nội dung tài liệu nguồn.\n"
+        "5. DẪN CHỨNG (source_reference): Ghi rõ câu hỏi lấy từ mục/đoạn nào trong tài liệu.\n"
+        "6. TUYỆT ĐỐI NGHIÊM CẤM sinh câu hỏi về các nội dung meta như: Lộ trình ôn tập (ví dụ: ngày 1 làm gì, ngày 2 làm gì), kế hoạch học tập, thời gian biểu, mục lục, tác giả, hoặc hướng dẫn đọc tài liệu.\n"
+        "7. CẤU TRÚC: Mỗi câu đúng 4 đáp án, duy nhất 1 đáp án có is_correct=true."
     )
 
     prompt = (
-        f"CHỦ ĐỀ CHUYÊN MÔN CẦN RA ĐỀ: {topic.title}\n"
+        f"CHỦ ĐỀ CHUYÊN MÔN CẦN QUÉT CẠN KIẾN THỨC: {topic.title}\n"
         f"Phạm vi tóm tắt: {topic.summary}\n"
-        f"Kiến thức trọng tâm: {points_str}\n\n"
-        f"YÊU CẦU: Hãy tạo đúng {q_count} câu hỏi trắc nghiệm chuyên sâu về chủ đề '{topic.title}'.\n"
+        f"Các ý kiến thức trọng tâm: {points_str}\n\n"
+        f"YÊU CẦU: Hãy duyệt toàn bộ nội dung của chủ đề này trong tài liệu dưới đây và sinh câu hỏi trắc nghiệm chuyên sâu cho TẤT CẢ các điểm kiến thức, khái niệm, cơ chế, đoạn mã, bug stories và câu hỏi phỏng vấn được đề cập.\n"
+        f"Hãy sinh liên tục cho đến khi HẾT LƯỢNG KIẾN THỨC của chủ đề này trong tài liệu (Exhaustive Coverage), tuyệt đối không bỏ sót.\n\n"
         f"Ngôn ngữ: {lang_instruction}\n"
         f"Độ khó: {diff_instruction}\n"
         f"{cat_hint}\n\n"
@@ -293,25 +308,39 @@ async def _generate_single_topic_questions(
         f"<DOCUMENT_SOURCE>\n{doc_text[:45000]}\n</DOCUMENT_SOURCE>"
     )
 
-    try:
-        response = await client.aio.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json",
-                response_schema=_TopicBatchQuizOutput,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                temperature=0.3,
-            ),
-        )
-        if response.parsed and isinstance(response.parsed, _TopicBatchQuizOutput):
-            return response.parsed.questions
-        if response.text:
-            parsed = _TopicBatchQuizOutput.model_validate_json(response.text)
-            return parsed.questions
-    except Exception as exc:
-        logger.warning("Error generating questions for topic '%s': %s", topic.title, exc)
+    models = [settings.GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.5-flash"]
+    seen = set()
+    candidate_models = [m for m in models if not (m in seen or seen.add(m))]
+
+    for model_name in candidate_models:
+        for attempt in range(3):
+            try:
+                response = await client.aio.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                        response_schema=_TopicBatchQuizOutput,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                        temperature=0.2,
+                    ),
+                )
+                if response.parsed and isinstance(response.parsed, _TopicBatchQuizOutput):
+                    return response.parsed.questions
+                if response.text:
+                    parsed = _TopicBatchQuizOutput.model_validate_json(response.text)
+                    return parsed.questions
+            except Exception as exc:
+                err_msg = str(exc)
+                logger.warning(
+                    "Model %s failed for topic '%s' (attempt %d): %s",
+                    model_name, topic.title, attempt + 1, err_msg[:120]
+                )
+                if "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                break
     return []
 
 
@@ -322,9 +351,9 @@ async def generate_questions_by_topics(
     difficulty: str = "mixed",
     language: str = "vi",
     category_name: str | None = None,
-    density: str = "comprehensive",
+    density: str = "exhaustive",
 ) -> list[GeneratedQuestionItem]:
-    """Generate comprehensive, exhaustive questions across selected topics in parallel."""
+    """Generate comprehensive, exhaustive questions across selected topics in parallel until all knowledge is exhausted."""
     if not settings.GEMINI_API_KEY:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -333,7 +362,6 @@ async def generate_questions_by_topics(
 
     # 1. Filter out meta topics (e.g. "Lộ trình ôn tập 5 ngày")
     substantive_topics = [t for t in all_topics if not getattr(t, "is_meta", False)]
-    # Fallback if all topics were flagged as meta
     if not substantive_topics:
         substantive_topics = all_topics
 
@@ -353,36 +381,17 @@ async def generate_questions_by_topics(
         if not target_topics:
             target_topics = substantive_topics
 
-    # 3. Determine questions per topic dynamically
-    # If 1 topic chosen: 6-8 questions
-    # If 2-4 topics chosen: 4-5 questions per topic
-    # If 5+ topics chosen: 3-4 questions per topic (e.g. 10 topics -> 30-40 questions)
-    num_topics = len(target_topics)
-    if density == "focused":
-        q_per_topic = 2 if num_topics >= 6 else 3
-    else:
-        # Comprehensive
-        if num_topics == 1:
-            q_per_topic = 6
-        elif num_topics <= 3:
-            q_per_topic = 5
-        elif num_topics <= 6:
-            q_per_topic = 4
-        else:
-            q_per_topic = 3
-
     client = genai.Client(
         api_key=settings.GEMINI_API_KEY,
         http_options={"api_version": "v1beta"},
     )
 
-    # 4. Generate in parallel using asyncio.gather
+    # 3. Generate exhaustively in parallel across all target topics
     tasks = [
         _generate_single_topic_questions(
             client=client,
             doc_text=doc_text,
             topic=t,
-            q_count=q_per_topic,
             difficulty=difficulty,
             language=language,
             category_name=category_name,
@@ -393,9 +402,17 @@ async def generate_questions_by_topics(
     results = await asyncio.gather(*tasks)
     raw_questions: list[_GeminiQuestion] = [q for sublist in results for q in sublist]
 
-    # 5. Normalize and validate output
+    # 4. Normalize, validate output and deduplicate
     validated: list[GeneratedQuestionItem] = []
+    seen_contents = set()
+
     for q in raw_questions:
+        c_clean = q.content.strip()
+        c_key = re.sub(r"\s+", " ", c_clean.lower())[:80]
+        if c_key in seen_contents:
+            continue
+        seen_contents.add(c_key)
+
         opts = [
             GeneratedOptionItem(content=o.content.strip(), is_correct=bool(o.is_correct))
             for o in q.options
@@ -417,7 +434,7 @@ async def generate_questions_by_topics(
 
         validated.append(
             GeneratedQuestionItem(
-                content=q.content.strip(),
+                content=c_clean,
                 code_snippet=q.code_snippet.strip() if q.code_snippet else None,
                 code_language=q.code_language.strip() if q.code_language else None,
                 explanation=full_explanation,
