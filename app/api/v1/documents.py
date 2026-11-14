@@ -1,4 +1,5 @@
-from uuid import UUID
+import re
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
@@ -19,7 +20,11 @@ from app.schemas.document import (
     GeneratedQuestionItem,
 )
 from app.services.ai_service import generate_questions_from_text
-from app.services.document_parser import parse_uploaded_document, sanitize_extracted_text
+from app.services.document_parser import (
+    parse_uploaded_document,
+    sanitize_extracted_text,
+    sanitize_filename,
+)
 
 router = APIRouter(prefix="/documents", tags=["Documents & AI"])
 
@@ -36,6 +41,59 @@ def _to_document_response(doc: Document) -> DocumentResponse:
         preview=preview,
         created_at=doc.created_at,
     )
+
+
+async def _resolve_or_create_category(
+    db: AsyncSession,
+    category_id: UUID | None = None,
+    category_slug: str | None = None,
+    category_name: str | None = None,
+    default_title: str = "Tài liệu học tập",
+) -> Category:
+    """Find category by ID/slug/name, or auto-create one gracefully."""
+    category: Category | None = None
+    if category_id is not None:
+        category = await db.get(Category, category_id)
+    elif category_slug:
+        category = await db.scalar(select(Category).where(Category.slug == category_slug))
+    elif category_name and category_name.strip():
+        name_clean = category_name.strip()
+        category = await db.scalar(select(Category).where(Category.name.ilike(name_clean)))
+        if category is None:
+            slug = re.sub(r"[^a-z0-9]+", "-", name_clean.lower()).strip("-") or "danh-muc"
+            if await db.scalar(select(Category).where(Category.slug == slug)):
+                slug = f"{slug}-{uuid4().hex[:6]}"
+            category = Category(
+                name=name_clean,
+                slug=slug,
+                description=f"Danh mục {name_clean}",
+                color="#4F46E5",
+                icon="folder",
+                order_index=1,
+            )
+            db.add(category)
+            await db.flush()
+
+    if category is None:
+        category = await db.scalar(select(Category).order_by(Category.order_index).limit(1))
+
+    if category is None:
+        name_clean = default_title.strip()[:60] or "Tài liệu học tập"
+        slug = re.sub(r"[^a-z0-9]+", "-", name_clean.lower()).strip("-") or "tai-lieu"
+        if await db.scalar(select(Category).where(Category.slug == slug)):
+            slug = f"{slug}-{uuid4().hex[:6]}"
+        category = Category(
+            name=name_clean,
+            slug=slug,
+            description="Danh mục tạo tự động từ tài liệu học tập",
+            color="#4F46E5",
+            icon="book-open",
+            order_index=1,
+        )
+        db.add(category)
+        await db.flush()
+
+    return category
 
 
 @router.get("", response_model=list[DocumentResponse])
@@ -87,7 +145,7 @@ async def create_text_document(
     if len(sanitized_text) < 20:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Document text is too short after sanitization.",
+            detail="Nội dung tài liệu quá ngắn sau khi lọc bảo mật.",
         )
     doc = Document(
         user_id=current_user.id,
@@ -104,6 +162,134 @@ async def create_text_document(
     return _to_document_response(doc)
 
 
+@router.post("/quick-generate", response_model=DocumentGenerateResponse)
+@limiter.limit(settings.RATE_LIMIT_AI)
+async def quick_generate_from_document(
+    request: Request,
+    file: UploadFile | None = File(default=None),
+    pasted_text: str | None = Form(default=None),
+    title: str | None = Form(default=None),
+    category_id: UUID | None = Form(default=None),
+    category_name: str | None = Form(default=None),
+    num_questions: int = Form(default=5),
+    difficulty: str = Form(default="mixed"),
+    language: str = Form(default="vi"),
+    save_to_bank: bool = Form(default=True),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentGenerateResponse:
+    """One-stop endpoint: Ingests document file or pasted text -> runs RAG -> saves questions -> returns results."""
+    # 1. Extract and sanitize text
+    if file is not None and file.filename:
+        safe_name, file_type, size_bytes, sanitized_text = await parse_uploaded_document(file)
+        doc_title = (title or "").strip() or safe_name
+    elif pasted_text and pasted_text.strip():
+        sanitized_text = sanitize_extracted_text(pasted_text)
+        safe_name = None
+        file_type = "text"
+        size_bytes = len(sanitized_text.encode("utf-8"))
+        doc_title = (title or "").strip() or "Tài liệu ghi chú"
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Vui lòng tải lên một file tài liệu (.pdf, .docx, .md, .txt) hoặc dán văn bản nội dung.",
+        )
+
+    if len(sanitized_text) < 30:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Nội dung tài liệu quá ngắn để có thể sinh câu hỏi trắc nghiệm.",
+        )
+
+    # 2. Save Document
+    doc = Document(
+        user_id=current_user.id,
+        title=doc_title[:255],
+        original_filename=safe_name,
+        file_type=file_type,
+        file_size_bytes=size_bytes,
+        content_text=sanitized_text,
+        char_count=len(sanitized_text),
+    )
+    db.add(doc)
+    await db.flush()
+
+    # 3. Resolve category
+    category = await _resolve_or_create_category(
+        db=db,
+        category_id=category_id,
+        category_name=category_name,
+        default_title=doc_title,
+    )
+
+    # 4. Run RAG Question Generation
+    generated = await generate_questions_from_text(
+        doc_text=sanitized_text,
+        num_questions=max(1, min(20, num_questions)),
+        difficulty=difficulty,
+        language=language,
+        category_name=category.name,
+    )
+
+    # 5. Persist to question bank if requested
+    output_questions: list[GeneratedQuestionItem] = []
+    if save_to_bank:
+        for item in generated:
+            q = Question(
+                category_id=category.id,
+                user_id=current_user.id,
+                document_id=doc.id,
+                content=item.content,
+                code_snippet=item.code_snippet,
+                code_language=item.code_language,
+                explanation=item.explanation,
+                source_reference=item.source_reference,
+                difficulty=item.difficulty,
+                source="ai",
+                is_public=False,
+            )
+            for idx, opt in enumerate(item.options):
+                q.options.append(
+                    QuestionOption(
+                        content=opt.content,
+                        is_correct=opt.is_correct,
+                        order_index=idx,
+                    )
+                )
+            db.add(q)
+            await db.flush()
+            output_questions.append(
+                item.model_copy(
+                    update={
+                        "id": q.id,
+                        "category_id": category.id,
+                        "category_slug": category.slug,
+                    }
+                )
+            )
+        await db.commit()
+    else:
+        await db.commit()
+        for item in generated:
+            output_questions.append(
+                item.model_copy(
+                    update={
+                        "category_id": category.id,
+                        "category_slug": category.slug,
+                    }
+                )
+            )
+
+    return DocumentGenerateResponse(
+        document_id=doc.id,
+        document_title=doc.title,
+        category_id=category.id,
+        category_slug=category.slug,
+        saved=save_to_bank,
+        questions=output_questions,
+    )
+
+
 @router.post("/{document_id}/generate", response_model=DocumentGenerateResponse)
 @limiter.limit(settings.RATE_LIMIT_AI)
 async def generate_quiz_from_document(
@@ -117,29 +303,20 @@ async def generate_quiz_from_document(
     if doc is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found.",
+            detail="Không tìm thấy tài liệu.",
         )
     if doc.user_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have permission to access this document.",
+            detail="Bạn không có quyền truy cập tài liệu này.",
         )
 
-    category: Category | None = None
-    if payload.category_id is not None:
-        category = await db.get(Category, payload.category_id)
-    elif payload.category_slug:
-        category = await db.scalar(
-            select(Category).where(Category.slug == payload.category_slug)
-        )
-    elif payload.save_to_bank:
-        category = await db.scalar(select(Category).order_by(Category.order_index).limit(1))
-
-    if (payload.category_id or payload.category_slug or payload.save_to_bank) and category is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Target category not found.",
-        )
+    category = await _resolve_or_create_category(
+        db=db,
+        category_id=payload.category_id,
+        category_slug=payload.category_slug,
+        default_title=doc.title,
+    )
 
     generated = await generate_questions_from_text(
         doc_text=doc.content_text,
@@ -160,6 +337,7 @@ async def generate_quiz_from_document(
                 code_snippet=item.code_snippet,
                 code_language=item.code_language,
                 explanation=item.explanation,
+                source_reference=item.source_reference,
                 difficulty=item.difficulty,
                 source="ai",
                 is_public=False,
@@ -197,6 +375,7 @@ async def generate_quiz_from_document(
 
     return DocumentGenerateResponse(
         document_id=doc.id,
+        document_title=doc.title,
         category_id=category.id if category else None,
         category_slug=category.slug if category else None,
         saved=payload.save_to_bank,

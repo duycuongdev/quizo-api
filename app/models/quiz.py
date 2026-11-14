@@ -43,6 +43,7 @@ class Question(Base):
     code_snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
     code_language: Mapped[str | None] = mapped_column(String(40), nullable=True)
     explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    source_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
     difficulty: Mapped[str] = mapped_column(String(20), nullable=False, default="medium")
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
