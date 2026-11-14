@@ -1,3 +1,7 @@
+import re
+import unicodedata
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,15 +11,76 @@ from app.api.v1.deps import get_optional_current_user
 from app.core.database import get_db
 from app.models.quiz import Category, Question, Quiz
 from app.models.user import User
-from app.schemas.quiz import CategoryDetailResponse, CategoryResponse, QuizSummary
+from app.schemas.quiz import (
+    CategoryCreateRequest,
+    CategoryDetailResponse,
+    CategoryResponse,
+    QuizSummary,
+)
 
 router = APIRouter(prefix="/categories", tags=["Categories"])
+
+
+def _slugify(text: str) -> str:
+    norm = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("utf-8")
+    cleaned = re.sub(r"[^\w\s-]", "", norm).strip().lower()
+    return re.sub(r"[-\s]+", "-", cleaned) or "category"
 
 
 def _visibility_filter(current_user: User | None):
     if current_user is not None:
         return or_(Question.is_public.is_(True), Question.user_id == current_user.id)
     return Question.is_public.is_(True)
+
+
+@router.post("", response_model=CategoryResponse, status_code=status.HTTP_201_CREATED)
+async def create_category(
+    payload: CategoryCreateRequest,
+    current_user: User | None = Depends(get_optional_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CategoryResponse:
+    cleaned_name = payload.name.strip()
+    base_slug = _slugify(cleaned_name)
+    slug = base_slug
+
+    existing = await db.scalar(select(Category).where(Category.slug == slug))
+    if existing is not None:
+        if existing.name.lower() == cleaned_name.lower():
+            return CategoryResponse(
+                id=existing.id,
+                name=existing.name,
+                slug=existing.slug,
+                description=existing.description,
+                icon=existing.icon,
+                color=existing.color,
+                order_index=existing.order_index,
+                question_count=0,
+            )
+        slug = f"{base_slug}-{uuid4().hex[:6]}"
+
+    max_order = await db.scalar(select(func.coalesce(func.max(Category.order_index), 0)))
+    cat = Category(
+        name=cleaned_name,
+        slug=slug,
+        description=payload.description or f"Danh mục tùy chỉnh: {cleaned_name}",
+        icon=payload.icon or "folder",
+        color=payload.color or "#4F46E5",
+        order_index=(max_order or 0) + 1,
+    )
+    db.add(cat)
+    await db.commit()
+    await db.refresh(cat)
+
+    return CategoryResponse(
+        id=cat.id,
+        name=cat.name,
+        slug=cat.slug,
+        description=cat.description,
+        icon=cat.icon,
+        color=cat.color,
+        order_index=cat.order_index,
+        question_count=0,
+    )
 
 
 @router.get("", response_model=list[CategoryResponse])
