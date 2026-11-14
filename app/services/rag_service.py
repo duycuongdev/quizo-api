@@ -244,6 +244,7 @@ def _call_gemini_rag_sync(
             system_instruction=system_instruction,
             response_mime_type="application/json",
             response_schema=_GeminiRAGQuizOutput,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
             temperature=0.3,
         ),
     )
