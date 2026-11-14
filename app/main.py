@@ -30,6 +30,10 @@ async def _migrate_users_schema(conn) -> None:
             await conn.execute(
                 text("UPDATE users SET is_verified = 1 WHERE auth_provider = 'google' AND is_verified = 0")
             )
+        q_res = await conn.execute(text("PRAGMA table_info(questions)"))
+        q_cols = {row[1] for row in q_res.fetchall()}
+        if q_cols and "source_reference" not in q_cols:
+            await conn.execute(text("ALTER TABLE questions ADD COLUMN source_reference VARCHAR(255)"))
     except Exception:
         # PostgreSQL fallback
         try:
@@ -39,6 +43,7 @@ async def _migrate_users_schema(conn) -> None:
             await conn.execute(
                 text("UPDATE users SET is_verified = TRUE WHERE auth_provider = 'google' AND is_verified = FALSE")
             )
+            await conn.execute(text("ALTER TABLE questions ADD COLUMN IF NOT EXISTS source_reference VARCHAR(255)"))
         except Exception:
             pass
 
@@ -48,14 +53,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _migrate_users_schema(conn)
-    # Seed initial AI Engineer categories/questions idempotently if available
-    try:
-        from app.db.seed import seed_database
-
-        async with AsyncSessionLocal() as session:
-            await seed_database(session)
-    except ImportError:
-        pass
     yield
 
 

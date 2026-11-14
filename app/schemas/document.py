@@ -51,12 +51,14 @@ class GeneratedQuestionItem(BaseModel):
     code_snippet: str | None = None
     code_language: str | None = None
     explanation: str
+    source_reference: str | None = None
     difficulty: Literal["easy", "medium", "hard"] = "medium"
     options: list[GeneratedOptionItem]
 
 
 class DocumentGenerateResponse(BaseModel):
     document_id: UUID
+    document_title: str | None = None
     category_id: UUID | None = None
     category_slug: str | None = None
     saved: bool
