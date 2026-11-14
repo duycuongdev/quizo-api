@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_AI: str = "5/minute"
 
     # Email & SMTP Settings (Brevo)
+    BREVO_API_KEY: str = ""
     SMTP_SERVER: str = "smtp-relay.brevo.com"
     SMTP_PORT: int = 587
     SMTP_USER: str = ""
