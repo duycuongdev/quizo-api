@@ -401,6 +401,7 @@ async def generate_from_topics(
         difficulty=payload.difficulty,
         language=payload.language,
         category_name=category.name,
+        density=payload.density,
     )
 
     output_questions: list[GeneratedQuestionItem] = []

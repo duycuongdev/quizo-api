@@ -70,6 +70,7 @@ class TopicItem(BaseModel):
     title: str
     summary: str
     key_points: list[str] = Field(default_factory=list)
+    is_meta: bool = Field(default=False, description="True nếu chỉ là lộ trình, kế hoạch thời gian, mục lục")
 
 
 class DocumentAnalyzeResponse(BaseModel):
@@ -84,6 +85,7 @@ class DocumentAnalyzeResponse(BaseModel):
 class TopicGenerateRequest(BaseModel):
     document_id: UUID
     selected_topic_ids: list[str] = Field(default_factory=lambda: ["all"])
+    density: Literal["focused", "comprehensive"] = "comprehensive"
     difficulty: Literal["easy", "medium", "hard", "mixed"] = "mixed"
     language: Literal["vi", "en"] = "vi"
     category_id: UUID | None = None
