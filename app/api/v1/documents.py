@@ -386,17 +386,20 @@ async def generate_from_topics(
             detail="Tài liệu không tồn tại hoặc bạn không có quyền truy cập.",
         )
 
-    # Extract outline topics first
-    _title, all_topics = await extract_document_topics(doc.content_text)
+    # 1. Use pre-extracted topics from frontend if present to save API quota and preserve user selection
+    if payload.topics and len(payload.topics) > 0:
+        all_topics = payload.topics
+    else:
+        _title, all_topics = await extract_document_topics(doc.content_text)
 
-    # Resolve category
+    # 2. Resolve category
     category = await _resolve_or_create_category(
         db=db,
         category_id=payload.category_id,
         default_title=doc.title,
     )
 
-    # Generate exhaustive questions for the selected topics
+    # 3. Generate exhaustive questions for the selected topics
     generated = await generate_questions_by_topics(
         doc_text=doc.content_text,
         all_topics=all_topics,
