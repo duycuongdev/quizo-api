@@ -3,10 +3,9 @@
 Implements:
 1. Semantic & Markdown-aware Document Chunking.
 2. Vector Embedding computation via Google Gemini Embedding (gemini-embedding-001).
-3. Cosine similarity retrieval for topic-focused questions or stratified coverage
-   sampling for comprehensive document quiz creation.
-4. Strictly grounded Prompt Generation ensuring questions are anchored in retrieved
-   chunks with exact source citations.
+3. Document Outline & Topic extraction (Tóm tắt các đầu mục cần học để user chọn).
+4. Exhaustive Question Generation for selected topics or whole document (không cần cấu hình số câu).
+5. Grounded Prompt Generation with exact source citations.
 """
 
 import asyncio
@@ -21,7 +20,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
-from app.schemas.document import GeneratedOptionItem, GeneratedQuestionItem
+from app.schemas.document import GeneratedOptionItem, GeneratedQuestionItem, TopicItem
 
 logger = logging.getLogger("quizo.rag")
 
@@ -52,6 +51,16 @@ class _GeminiQuestion(BaseModel):
 
 
 class _GeminiRAGQuizOutput(BaseModel):
+    questions: list[_GeminiQuestion]
+
+
+class _DocumentOutlineOutput(BaseModel):
+    document_title: str
+    topics: list[TopicItem]
+
+
+class _TopicQuizOutput(BaseModel):
+    selected_scope_title: str
     questions: list[_GeminiQuestion]
 
 
@@ -112,7 +121,6 @@ def chunk_document_text(
                 )
             )
 
-    # Fallback for very small documents
     if not chunks and text.strip():
         chunks.append(
             DocumentChunk(
@@ -144,7 +152,6 @@ def select_relevant_chunks(
     if len(chunks) <= max_chunks:
         return chunks
 
-    # If focus topic provided and client available, use embedding similarity
     if focus_topic and client and settings.GEMINI_API_KEY:
         try:
             topic_embed_res = client.models.embed_content(
@@ -152,7 +159,6 @@ def select_relevant_chunks(
             )
             topic_vec = topic_embed_res.embeddings[0].values
 
-            # Score each chunk
             scored = []
             for ch in chunks:
                 if ch.embedding is None:
@@ -168,7 +174,7 @@ def select_relevant_chunks(
         except Exception as exc:
             logger.warning("RAG embedding retrieval fallback to stratified sampling: %s", exc)
 
-    # Stratified coverage sampling: pick chunks evenly distributed across the document
+    # Stratified coverage sampling
     step = len(chunks) / max_chunks
     selected: list[DocumentChunk] = []
     for i in range(max_chunks):
@@ -176,6 +182,235 @@ def select_relevant_chunks(
         if chunks[idx] not in selected:
             selected.append(chunks[idx])
     return selected
+
+
+def _call_gemini_extract_topics_sync(doc_text: str) -> tuple[str, list[TopicItem]]:
+    client = genai.Client(
+        api_key=settings.GEMINI_API_KEY,
+        http_options={"api_version": "v1beta"},
+    )
+    system_instruction = (
+        "Bạn là một chuyên gia phân tích tài liệu và sư phạm giáo dục hàng đầu.\n"
+        "Nhiệm vụ của bạn là đọc hiểu tài liệu và phân tích thành danh sách các ĐẦU MỤC KIẾN THỨC CẦN HỌC có cấu trúc rõ ràng bằng Tiếng Việt.\n"
+        "Mỗi đầu mục đại diện cho một chủ đề độc lập để người học có thể chọn ôn luyện riêng từng phần.\n"
+        "Yêu cầu cho mỗi đầu mục (TopicItem):\n"
+        "- id: Số thứ tự dạng chuỗi: '1', '2', '3',...\n"
+        "- title: Tên tiêu đề đầu mục ngắn gọn, súc tích (ví dụ: 'Kiến trúc Backend & MongoDB', 'Cơ chế Xác thực JWT', v.v.).\n"
+        "- summary: Tóm tắt 1-2 câu về phạm vi kiến thức trong phần này.\n"
+        "- key_points: 2 đến 4 ý kiến thức cốt lõi được đề cập trong mục này.\n"
+        "document_title: Đặt tiêu đề ngắn gọn phản ánh đúng nội dung tài liệu."
+    )
+    prompt = (
+        "Hãy phân tích và tóm tắt toàn bộ các đầu mục kiến thức cần học trong tài liệu dưới đây:\n\n"
+        f"<DOCUMENT>\n{doc_text[:40000]}\n</DOCUMENT>"
+    )
+    response = client.models.generate_content(
+        model=settings.GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            response_mime_type="application/json",
+            response_schema=_DocumentOutlineOutput,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            temperature=0.2,
+        ),
+    )
+    if response.parsed and isinstance(response.parsed, _DocumentOutlineOutput):
+        return response.parsed.document_title, response.parsed.topics
+    if response.text:
+        parsed = _DocumentOutlineOutput.model_validate_json(response.text)
+        return parsed.document_title, parsed.topics
+    return "Tài liệu học tập", []
+
+
+async def extract_document_topics(doc_text: str) -> tuple[str, list[TopicItem]]:
+    """Analyze document and extract structured learning outline/topics with summaries."""
+    if not settings.GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI service is not configured.",
+        )
+    try:
+        return await asyncio.to_thread(_call_gemini_extract_topics_sync, doc_text)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to extract document topics: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Không thể phân tích đầu mục tài liệu: {str(exc)}",
+        ) from exc
+
+
+def _call_gemini_generate_by_topics_sync(
+    doc_text: str,
+    topics_context: str,
+    scope_title: str,
+    difficulty: str,
+    language: str,
+    category_name: str | None,
+) -> _TopicQuizOutput:
+    client = genai.Client(
+        api_key=settings.GEMINI_API_KEY,
+        http_options={"api_version": "v1beta"},
+    )
+    lang_instruction = (
+        "Soạn câu hỏi và đáp án hoàn toàn bằng Tiếng Việt tự nhiên, súc tích và chuẩn mực giáo dục. "
+        "Giữ nguyên thuật ngữ kỹ thuật tiếng Anh (REST, JWT, React, Docker,...)."
+        if language == "vi"
+        else "Generate questions and explanations completely in clear, standard English."
+    )
+    diff_instruction = {
+        "easy": "Mức độ DỄ (Định nghĩa, khái niệm cơ bản, vai trò).",
+        "medium": "Mức độ TRUNG BÌNH (Cơ chế, so sánh, ưu/nhược điểm).",
+        "hard": "Mức độ KHÓ (Phân tích tình huống, xử lý lỗi, kiến trúc sâu).",
+        "mixed": "Mức độ TỔNG HỢP (Kết hợp cân đối câu dễ, trung bình và khó).",
+    }.get(difficulty, "Mức độ TỔNG HỢP.")
+
+    system_instruction = (
+        "Bạn là một chuyên gia giáo dục tạo câu hỏi trắc nghiệm chuyên sâu dựa trên RAG.\n"
+        "QUY TẮC CỐT LÕI:\n"
+        "1. TỰ ĐỘNG XÁC ĐỊNH SỐ LƯỢNG: Hãy sinh TOÀN BỘ lượng câu hỏi trắc nghiệm khách quan cần thiết để kiểm tra đầy đủ, "
+        "bao quát toàn diện mọi kiến thức trong phạm vi được yêu cầu (thông thường từ 4 đến 15 câu tùy thuộc vào độ dài và mật độ kiến thức của các mục được chọn).\n"
+        "2. GROUNDING BẮT BUỘC: Toàn bộ câu hỏi, đáp án và giải thích PHẢI BÁM SÁT 100% VÀO NỘI DUNG TÀI LIỆU. Không suy diễn ngoài tài liệu.\n"
+        "3. DẪN CHỨNG (source_reference): Ghi rõ câu hỏi lấy từ mục/đoạn trích nào trong tài liệu.\n"
+        "4. GIẢI THÍCH: Trình bày chi tiết lý do đáp án đúng dựa vào câu chữ trong tài liệu.\n"
+        "5. CẤU TRÚC: Mỗi câu đúng 4 đáp án, duy nhất 1 đáp án có is_correct=true."
+    )
+
+    cat_hint = f"Lĩnh vực: {category_name}." if category_name else ""
+
+    prompt = (
+        f"PHẠM VI ĐẦU MỤC ĐƯỢC CHỌN ĐỂ SINH CÂU HỎI:\n{topics_context}\n\n"
+        f"NGÔN NGỮ: {lang_instruction}\n"
+        f"ĐỘ KHÓ: {diff_instruction}\n"
+        f"{cat_hint}\n\n"
+        "Hãy sinh toàn bộ lượng câu hỏi trắc nghiệm khách quan bao quát hết mọi kiến thức của các mục trên dựa vào nội dung tài liệu gốc sau đây:\n"
+        f"<DOCUMENT_SOURCE>\n{doc_text[:45000]}\n</DOCUMENT_SOURCE>"
+    )
+
+    response = client.models.generate_content(
+        model=settings.GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            response_mime_type="application/json",
+            response_schema=_TopicQuizOutput,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            temperature=0.3,
+        ),
+    )
+    if response.parsed and isinstance(response.parsed, _TopicQuizOutput):
+        return response.parsed
+    if response.text:
+        return _TopicQuizOutput.model_validate_json(response.text)
+    raise ValueError("Empty response from Gemini API.")
+
+
+async def generate_questions_by_topics(
+    doc_text: str,
+    all_topics: list[TopicItem],
+    selected_topic_ids: list[str],
+    difficulty: str = "mixed",
+    language: str = "vi",
+    category_name: str | None = None,
+) -> list[GeneratedQuestionItem]:
+    """Generate exhaustive questions for selected topics without requiring question count input."""
+    if not settings.GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI generation service is not configured.",
+        )
+
+    # Determine selected topics
+    is_all = (
+        not selected_topic_ids
+        or "all" in selected_topic_ids
+        or len(selected_topic_ids) >= len(all_topics)
+    )
+
+    if is_all:
+        scope_title = "Toàn bộ tài liệu"
+        context_parts = []
+        for t in all_topics:
+            points_str = "; ".join(t.key_points) if t.key_points else ""
+            context_parts.append(
+                f"- Mục {t.id}: {t.title}\n  Tóm tắt: {t.summary}\n  Kiến thức trọng tâm: {points_str}"
+            )
+        topics_context = "TOÀN BỘ CÁC ĐẦU MỤC TRONG TÀI LIỆU:\n" + "\n".join(context_parts)
+    else:
+        chosen = [t for t in all_topics if str(t.id) in selected_topic_ids]
+        if not chosen:
+            chosen = all_topics
+        scope_title = ", ".join(t.title for t in chosen)
+        context_parts = []
+        for t in chosen:
+            points_str = "; ".join(t.key_points) if t.key_points else ""
+            context_parts.append(
+                f"- Mục {t.id}: {t.title}\n  Tóm tắt: {t.summary}\n  Kiến thức trọng tâm: {points_str}"
+            )
+        topics_context = "CÁC ĐẦU MỤC ĐƯỢC CHỌN:\n" + "\n".join(context_parts)
+
+    try:
+        raw_output = await asyncio.to_thread(
+            _call_gemini_generate_by_topics_sync,
+            doc_text,
+            topics_context,
+            scope_title,
+            difficulty,
+            language,
+            category_name,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Topic question generation error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"AI sinh câu hỏi theo mục thất bại: {str(exc)}",
+        ) from exc
+
+    # Validate and normalize
+    validated: list[GeneratedQuestionItem] = []
+    for q in raw_output.questions:
+        opts = [
+            GeneratedOptionItem(content=o.content.strip(), is_correct=bool(o.is_correct))
+            for o in q.options
+            if o.content.strip()
+        ]
+        if len(opts) < 2:
+            continue
+        correct_indices = [i for i, o in enumerate(opts) if o.is_correct]
+        if len(correct_indices) != 1:
+            chosen = correct_indices[0] if correct_indices else 0
+            opts = [
+                GeneratedOptionItem(content=o.content, is_correct=(idx == chosen))
+                for idx, o in enumerate(opts)
+            ]
+
+        full_explanation = q.explanation.strip()
+        if q.source_reference and q.source_reference not in full_explanation:
+            full_explanation = f"[Nguồn: {q.source_reference}]\n{full_explanation}"
+
+        validated.append(
+            GeneratedQuestionItem(
+                content=q.content.strip(),
+                code_snippet=q.code_snippet.strip() if q.code_snippet else None,
+                code_language=q.code_language.strip() if q.code_language else None,
+                explanation=full_explanation,
+                source_reference=q.source_reference,
+                difficulty=q.difficulty,
+                options=opts,
+            )
+        )
+
+    if not validated:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="AI service returned no valid questions.",
+        )
+
+    return validated
 
 
 def _call_gemini_rag_sync(
@@ -271,7 +506,6 @@ async def generate_rag_questions_from_document(
             detail="AI generation service is not configured.",
         )
 
-    # 1. Chunk document
     all_chunks = chunk_document_text(doc_text)
     if not all_chunks:
         raise HTTPException(
@@ -279,7 +513,6 @@ async def generate_rag_questions_from_document(
             detail="Document contains no readable text to chunk.",
         )
 
-    # 2. Select relevant chunks (max 8 chunks to fit context comfortably and accurately)
     client = genai.Client(
         api_key=settings.GEMINI_API_KEY,
         http_options={"api_version": "v1beta"},
@@ -291,7 +524,6 @@ async def generate_rag_questions_from_document(
         client=client,
     )
 
-    # 3. Call Gemini RAG
     try:
         raw_output = await asyncio.to_thread(
             _call_gemini_rag_sync,
@@ -311,7 +543,6 @@ async def generate_rag_questions_from_document(
             detail=f"AI RAG service failed: {str(exc)}",
         ) from exc
 
-    # 4. Normalize and validate output
     validated: list[GeneratedQuestionItem] = []
     for q in raw_output.questions[:num_questions]:
         opts = [
@@ -329,7 +560,6 @@ async def generate_rag_questions_from_document(
                 for idx, o in enumerate(opts)
             ]
 
-        # Append source citation to explanation if not present
         full_explanation = q.explanation.strip()
         if q.source_reference and q.source_reference not in full_explanation:
             full_explanation = f"[Nguồn: {q.source_reference}]\n{full_explanation}"
@@ -340,6 +570,7 @@ async def generate_rag_questions_from_document(
                 code_snippet=q.code_snippet.strip() if q.code_snippet else None,
                 code_language=q.code_language.strip() if q.code_language else None,
                 explanation=full_explanation,
+                source_reference=q.source_reference,
                 difficulty=q.difficulty,
                 options=opts,
             )

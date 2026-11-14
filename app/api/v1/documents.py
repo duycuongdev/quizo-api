@@ -13,13 +13,17 @@ from app.models.document import Document
 from app.models.quiz import Category, Question, QuestionOption
 from app.models.user import User
 from app.schemas.document import (
+    DocumentAnalyzeResponse,
     DocumentGenerateRequest,
     DocumentGenerateResponse,
     DocumentResponse,
     DocumentTextCreate,
     GeneratedQuestionItem,
+    TopicGenerateRequest,
+    TopicItem,
 )
 from app.services.ai_service import generate_questions_from_text
+from app.services.rag_service import extract_document_topics, generate_questions_by_topics
 from app.services.document_parser import (
     parse_uploaded_document,
     sanitize_extracted_text,
@@ -286,6 +290,172 @@ async def quick_generate_from_document(
         category_id=category.id,
         category_slug=category.slug,
         saved=save_to_bank,
+        questions=output_questions,
+    )
+
+
+@router.post("/analyze-topics", response_model=DocumentAnalyzeResponse)
+@limiter.limit(settings.RATE_LIMIT_AI)
+async def analyze_document_topics(
+    request: Request,
+    file: UploadFile | None = File(default=None),
+    pasted_text: str | None = Form(default=None),
+    document_id: UUID | None = Form(default=None),
+    title: str | None = Form(default=None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentAnalyzeResponse:
+    """Analyze document and extract structured learning outline/topics for user selection."""
+    doc: Document | None = None
+    if document_id:
+        doc = await db.get(Document, document_id)
+        if not doc or doc.user_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Tài liệu không tồn tại.",
+            )
+    elif file is not None and file.filename:
+        safe_name, file_type, size_bytes, sanitized_text = await parse_uploaded_document(file)
+        doc_title = (title or "").strip() or safe_name
+        doc = Document(
+            user_id=current_user.id,
+            title=doc_title[:255],
+            original_filename=safe_name,
+            file_type=file_type,
+            file_size_bytes=size_bytes,
+            content_text=sanitized_text,
+            char_count=len(sanitized_text),
+        )
+        db.add(doc)
+        await db.commit()
+        await db.refresh(doc)
+    elif pasted_text and pasted_text.strip():
+        sanitized_text = sanitize_extracted_text(pasted_text)
+        doc_title = (title or "").strip() or "Tài liệu ghi chú"
+        doc = Document(
+            user_id=current_user.id,
+            title=doc_title[:255],
+            original_filename=None,
+            file_type="text",
+            file_size_bytes=len(sanitized_text.encode("utf-8")),
+            content_text=sanitized_text,
+            char_count=len(sanitized_text),
+        )
+        db.add(doc)
+        await db.commit()
+        await db.refresh(doc)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Vui lòng tải lên tài liệu (.md, .docx, .pdf, .txt) hoặc dán văn bản.",
+        )
+
+    # Extract topics via Gemini
+    inferred_title, topics = await extract_document_topics(doc.content_text)
+    if inferred_title and (not doc.original_filename or doc.title.endswith((".md", ".txt", ".docx"))):
+        doc.title = inferred_title[:255]
+        await db.commit()
+
+    preview = doc.content_text[:250] + ("..." if len(doc.content_text) > 250 else "")
+    return DocumentAnalyzeResponse(
+        document_id=doc.id,
+        document_title=doc.title,
+        file_type=doc.file_type,
+        char_count=doc.char_count,
+        preview=preview,
+        topics=topics,
+    )
+
+
+@router.post("/generate-from-topics", response_model=DocumentGenerateResponse)
+@limiter.limit(settings.RATE_LIMIT_AI)
+async def generate_from_topics(
+    request: Request,
+    payload: TopicGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentGenerateResponse:
+    """Generate exhaustive questions for selected topics or the entire document."""
+    doc = await db.get(Document, payload.document_id)
+    if not doc or doc.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Tài liệu không tồn tại hoặc bạn không có quyền truy cập.",
+        )
+
+    # Extract outline topics first
+    _title, all_topics = await extract_document_topics(doc.content_text)
+
+    # Resolve category
+    category = await _resolve_or_create_category(
+        db=db,
+        category_id=payload.category_id,
+        default_title=doc.title,
+    )
+
+    # Generate exhaustive questions for the selected topics
+    generated = await generate_questions_by_topics(
+        doc_text=doc.content_text,
+        all_topics=all_topics,
+        selected_topic_ids=payload.selected_topic_ids,
+        difficulty=payload.difficulty,
+        language=payload.language,
+        category_name=category.name,
+    )
+
+    output_questions: list[GeneratedQuestionItem] = []
+    if payload.save_to_bank:
+        for item in generated:
+            q = Question(
+                category_id=category.id,
+                user_id=current_user.id,
+                document_id=doc.id,
+                content=item.content,
+                code_snippet=item.code_snippet,
+                code_language=item.code_language,
+                explanation=item.explanation,
+                source_reference=item.source_reference,
+                difficulty=item.difficulty,
+                source="ai",
+                is_public=False,
+            )
+            for idx, opt in enumerate(item.options):
+                q.options.append(
+                    QuestionOption(
+                        content=opt.content,
+                        is_correct=opt.is_correct,
+                        order_index=idx,
+                    )
+                )
+            db.add(q)
+            await db.flush()
+            output_questions.append(
+                item.model_copy(
+                    update={
+                        "id": q.id,
+                        "category_id": category.id,
+                        "category_slug": category.slug,
+                    }
+                )
+            )
+        await db.commit()
+    else:
+        for item in generated:
+            output_questions.append(
+                item.model_copy(
+                    update={
+                        "category_id": category.id,
+                        "category_slug": category.slug,
+                    }
+                )
+            )
+
+    return DocumentGenerateResponse(
+        document_id=doc.id,
+        document_title=doc.title,
+        category_id=category.id,
+        category_slug=category.slug,
+        saved=payload.save_to_bank,
         questions=output_questions,
     )
 
