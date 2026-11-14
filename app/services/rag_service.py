@@ -66,10 +66,10 @@ def is_duplicate_question(
     new_tokens: set[str], existing_token_sets: list[set[str]]
 ) -> bool:
     """Determine if a new question is semantically redundant with existing questions."""
-    if len(new_tokens) < 3:
+    if len(new_tokens) < 4:
         return False
     for existing in existing_token_sets:
-        if len(existing) < 3:
+        if len(existing) < 4:
             continue
         intersection = new_tokens & existing
         min_len = min(len(new_tokens), len(existing))
@@ -77,7 +77,7 @@ def is_duplicate_question(
         overlap_coeff = len(intersection) / min_len
         jaccard = len(intersection) / union_len
         # High overlap of key technical concepts
-        if overlap_coeff >= 0.70 or jaccard >= 0.50:
+        if overlap_coeff >= 0.85 and jaccard >= 0.60:
             return True
     return False
 
@@ -263,7 +263,14 @@ def _call_gemini_extract_topics_sync(doc_text: str) -> tuple[str, list[TopicItem
         f"<DOCUMENT>\n{doc_text[:40000]}\n</DOCUMENT>"
     )
 
-    models = [settings.GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.5-flash"]
+    models = [
+        settings.GEMINI_MODEL,
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+    ]
     seen = set()
     candidate_models = [m for m in models if not (m in seen or seen.add(m))]
 
@@ -381,7 +388,14 @@ async def _generate_single_topic_questions(
         f"<DOCUMENT_SOURCE>\n{doc_text[:45000]}\n</DOCUMENT_SOURCE>"
     )
 
-    models = [settings.GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-2.5-flash"]
+    models = [
+        settings.GEMINI_MODEL,
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+    ]
     seen = set()
     candidate_models = [m for m in models if not (m in seen or seen.add(m))]
 
@@ -453,6 +467,17 @@ async def generate_questions_by_topics(
         ]
         if not target_topics:
             target_topics = substantive_topics
+
+    if not target_topics:
+        target_topics = [
+            TopicItem(
+                id="1",
+                title="Toàn bộ nội dung tài liệu",
+                summary="Tổng hợp toàn diện kiến thức",
+                key_points=[],
+                is_meta=False,
+            )
+        ]
 
     client = genai.Client(
         api_key=settings.GEMINI_API_KEY,
@@ -551,9 +576,10 @@ async def generate_questions_by_topics(
         )
 
     if not validated:
+        logger.error("AI service produced 0 validated questions for topics: %s", [t.title for t in target_topics])
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="AI service returned no valid questions.",
+            detail="Hệ thống AI không thể sinh câu hỏi từ mục này. Vui lòng chọn lại mục khác hoặc thử lại sau giây lát.",
         )
 
     return validated
@@ -619,22 +645,41 @@ def _call_gemini_rag_sync(
         f"</DOCUMENT_CHUNKS>"
     )
 
-    response = client.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_schema=_GeminiRAGQuizOutput,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-            temperature=0.3,
-        ),
-    )
+    models = [
+        settings.GEMINI_MODEL,
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+    ]
+    seen = set()
+    candidate_models = [m for m in models if not (m in seen or seen.add(m))]
 
-    if response.parsed is not None and isinstance(response.parsed, _GeminiRAGQuizOutput):
-        return response.parsed
-    if response.text:
-        return _GeminiRAGQuizOutput.model_validate_json(response.text)
+    last_exc = None
+    for model_name in candidate_models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    response_schema=_GeminiRAGQuizOutput,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    temperature=0.3,
+                ),
+            )
+            if response.parsed is not None and isinstance(response.parsed, _GeminiRAGQuizOutput):
+                return response.parsed
+            if response.text:
+                return _GeminiRAGQuizOutput.model_validate_json(response.text)
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    if last_exc:
+        raise last_exc
     raise ValueError("Empty response from Gemini API.")
 
 
@@ -730,9 +775,10 @@ async def generate_rag_questions_from_document(
         )
 
     if not validated:
+        logger.error("AI service produced 0 validated questions for topics: %s", [t.title for t in target_topics])
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="AI service returned no valid questions.",
+            detail="Hệ thống AI không thể sinh câu hỏi từ mục này. Vui lòng chọn lại mục khác hoặc thử lại sau giây lát.",
         )
 
     return all_chunks, validated

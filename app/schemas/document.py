@@ -90,3 +90,4 @@ class TopicGenerateRequest(BaseModel):
     language: Literal["vi", "en"] = "vi"
     category_id: UUID | None = None
     save_to_bank: bool = True
+    topics: list[TopicItem] | None = None
