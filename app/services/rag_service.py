@@ -24,6 +24,63 @@ from app.schemas.document import GeneratedOptionItem, GeneratedQuestionItem, Top
 
 logger = logging.getLogger("quizo.rag")
 
+VI_STOPWORDS = {
+    "là", "gì", "như", "thế", "nào", "trong", "của", "cho", "và", "với",
+    "được", "khi", "tại", "sao", "để", "các", "có", "một", "này", "đó",
+    "theo", "về", "ra", "vào", "lại", "thực", "hiện", "cơ", "chế", "sau",
+    "đây", "tự", "động", "bị", "bởi", "do", "những", "làm", "phải", "cần",
+    "hãy", "hỏi", "chỉ", "nhiều", "mỗi", "hay", "hoặc", "nếu", "thì",
+    "what", "which", "how", "the", "and", "for", "with", "when", "why",
+}
+
+
+def clean_text_noise(text: str) -> str:
+    """Remove CJK/foreign hallucinated characters and normalize whitespaces."""
+    # Strip Chinese/CJK characters (e.g. '而非') accidentally emitted by multilingual LLMs
+    cleaned = re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf]+", "", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def clean_option_text(text: str) -> str:
+    """Strip leading 'A.', 'B)', '1.', 'a -' prefixes and clean noise."""
+    cleaned = clean_text_noise(text)
+    cleaned = re.sub(r"^[A-Da-d1-4][\.\:\)\-]\s*", "", cleaned).strip()
+    return cleaned
+
+
+def clean_question_text(text: str) -> str:
+    """Clean question prefix noise such as 'Câu 1:', '1.' etc."""
+    cleaned = clean_text_noise(text)
+    cleaned = re.sub(r"^(?:Câu\s+[0-9]+|[0-9]+)[\.\:\)\-]\s*", "", cleaned).strip()
+    return cleaned
+
+
+def extract_keywords(text: str) -> set[str]:
+    """Extract substantive technical tokens from text for deduplication."""
+    tokens = re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", text.lower())
+    return {t for t in tokens if len(t) > 1 and t not in VI_STOPWORDS}
+
+
+def is_duplicate_question(
+    new_tokens: set[str], existing_token_sets: list[set[str]]
+) -> bool:
+    """Determine if a new question is semantically redundant with existing questions."""
+    if len(new_tokens) < 3:
+        return False
+    for existing in existing_token_sets:
+        if len(existing) < 3:
+            continue
+        intersection = new_tokens & existing
+        min_len = min(len(new_tokens), len(existing))
+        union_len = len(new_tokens | existing)
+        overlap_coeff = len(intersection) / min_len
+        jaccard = len(intersection) / union_len
+        # High overlap of key technical concepts
+        if overlap_coeff >= 0.70 or jaccard >= 0.50:
+            return True
+    return False
+
 
 class DocumentChunk(BaseModel):
     index: int
@@ -284,15 +341,31 @@ async def _generate_single_topic_questions(
     points_str = "; ".join(topic.key_points) if topic.key_points else ""
 
     system_instruction = (
-        "Bạn là một chuyên gia kỹ thuật và sư phạm cao cấp chuyên thiết kế bài kiểm tra trắc nghiệm chuyên sâu.\n"
-        "NGUYÊN TẮC QUÉT CẠN KIẾN THỨC (EXHAUSTIVE KNOWLEDGE EXTRACTION):\n"
-        "1. NHIỆM VỤ: Khai thác TRIỆT ĐỂ và TOÀN DIỆN MỌI ĐIỂM KIẾN THỨC có trong tài liệu thuộc chủ đề được giao.\n"
-        "2. KHÔNG GIỚI HẠN SỐ CÂU HỎI: Với MỖI khái niệm, cơ chế hoạt động, quyết định kiến trúc, thông số cấu hình, đoạn mã code, bài học kinh nghiệm, giải pháp xử lý lỗi hoặc bug story độc lập trong tài liệu, BẮT BUỘC tạo 1 câu hỏi trắc nghiệm tương ứng.\n"
-        "3. SINH ĐẾN KHI HẾT KIẾN THỨC: Tiếp tục sinh câu hỏi cho đến khi toàn bộ lượng kiến thức chuyên môn trong tài liệu của chủ đề này được bao quát 100%, tuyệt đối không bỏ sót bất kỳ chi tiết hay bug story nào.\n"
-        "4. BÁM SÁT TÀI LIỆU NGUỒN 100%: Toàn bộ câu hỏi, đáp án đúng và giải thích chi tiết phải bám sát 100% vào nội dung tài liệu nguồn.\n"
-        "5. DẪN CHỨNG (source_reference): Ghi rõ câu hỏi lấy từ mục/đoạn nào trong tài liệu.\n"
-        "6. TUYỆT ĐỐI NGHIÊM CẤM sinh câu hỏi về các nội dung meta như: Lộ trình ôn tập (ví dụ: ngày 1 làm gì, ngày 2 làm gì), kế hoạch học tập, thời gian biểu, mục lục, tác giả, hoặc hướng dẫn đọc tài liệu.\n"
-        "7. CẤU TRÚC: Mỗi câu đúng 4 đáp án, duy nhất 1 đáp án có is_correct=true."
+        "Bạn là một chuyên gia kỹ thuật và sư phạm cao cấp chuyên thiết kế bài kiểm tra trắc nghiệm chuyên sâu cho kỹ sư phần mềm.\n\n"
+        "BỘ QUY TẮC CHUẨN XÁC VỀ KỸ THUẬT VÀ SƯ PHẠM (CRITICAL PEDAGOGICAL & TECHNICAL STANDARDS):\n\n"
+        "1. TÍNH CHÍNH XÁC KỸ THUẬT & TÍNH NHẤT QUÁN TUYỆT ĐỐI:\n"
+        "   - Socket.IO Flow: Sau khi Client A gọi REST API PUT/PATCH cập nhật DB thành công, Client A mới emit event lên Server -> Server gán senderId và broadcast event 'BE_BOARD_UPDATED' tới các client khác trong room qua `socket.to(boardId).emit(...)`. Tuyệt đối không nhầm server tự emit 'FE_...'.\n"
+        "   - dnd-kit Collision Detection: Thuật toán `closestCorners` đo khoảng cách giữa các góc (dùng cho Container/Column lớn), còn `pointerWithin` kiểm tra con trỏ chuột nằm trong droppable nào (dùng cho Card nhỏ). Sensor: `TouchSensor` dùng `delay: 250` để phân biệt drag vs scroll; `MouseSensor` dùng `distance: 10` để tránh click bị coi là drag.\n"
+        "   - Google OAuth (@react-oauth/google): Đăng nhập client-side nhận ID token/credential, cấu hình tại Google Cloud Console bắt buộc là 'Authorized JavaScript origins' (không phải 'Authorized redirect URIs').\n"
+        "   - MongoDB Ordered Arrays & Aggregation: Ghi đè cả mảng (columnOrderIds, cardOrderIds) là cơ chế Last-Write-Wins (LWW) — đây là một trade-off về thiết kế chứ không ngăn được race condition khi 2 người ghi đồng thời. Trong Aggregation, `$lookup` + `$unwind` KHÔNG bảo toàn thứ tự ban đầu của mảng, cần sắp xếp lại bằng `mapOrder` ở ứng dụng hoặc dùng `$indexOfArray`.\n"
+        "   - Cookie sameSite: 'none': Bắt buộc đi kèm `secure: true`. Do cookie tự động gửi trong cross-site request nên CSRF là rủi ro có thật, cần CORS allowlist nghiêm ngặt hoặc Custom Request Header (X-Requested-With, Bearer).\n"
+        "   - Redux & Token: Nếu Redux Persist lưu access token vào localStorage, toàn bộ rủi ro XSS trộm token lại xuất hiện, làm mất đi ưu điểm bảo vệ XSS của HttpOnly Cookie.\n"
+        "   - Refresh Token Rotation: Single-flight chỉ chống trùng trong 1 tab; khi mở 2 tab cùng lúc sẽ bị coi là token reuse và revoke toàn bộ session. Thao tác revoke token nếu nằm trong transaction bị abort thì blacklist jti sẽ bị rollback.\n"
+        "   - Socket Security: Handshake auth là chưa đủ, khi join_room bắt buộc phải check quyền truy cập board (`requireBoardAccess`) để chống IDOR.\n"
+        "   - Reverse Proxy: Ứng dụng sau proxy của Render cần `app.set('trust proxy', 1)` để req.ip nhận diện đúng client IP khi rate limit.\n"
+        "   - Test scripts: `npm test` chỉ chạy unit test; integration / e2e là script riêng (`npm run test:e2e`).\n\n"
+        "2. ĐÁP ÁN NHIỄU (DISTRACTORS INTEGRITY) - TUYỆT ĐỐI TRÁNH ĐÁP ÁN NHIỄU CŨNG ĐÚNG:\n"
+        "   - Các đáp án sai (is_correct=false) PHẢI THỰC SỰ SAI hoặc KHÔNG PHÙ HỢP với ngữ cảnh câu hỏi.\n"
+        "   - TUYỆT ĐỐI KHÔNG lấy một khẳng định vốn ĐÚNG trong thực tế kỹ thuật để làm đáp án sai (ví dụ: 'Unique index giúp tìm kiếm nhanh hơn' là khẳng định đúng vì nó tạo B-tree index, không được coi nó là sai; 'Render tự restart container khi fail health check' là đúng; 'React.memo cần đi kèm useCallback' là đúng; 'client không dùng được cookie' là lý do hợp lệ...). Nếu cần dùng, hãy biến nó thành một khẳng định sai rõ ràng.\n\n"
+        "3. SỰ KHỚP NỐI CÂU HỎI - ĐÁP ÁN (QUESTION-ANSWER ALIGNMENT):\n"
+        "   - Khi câu hỏi hỏi 'Giải pháp / Cách khắc phục lỗi X là gì?', đáp án đúng BẮT BUỘC PHẢI LÀ GIẢI PHÁP (Solution), tuyệt đối không đưa nguyên nhân (Root cause) vào làm đáp án đúng.\n"
+        "   - Không suy diễn thông tin ngoài tài liệu.\n\n"
+        "4. ĐỊNH DẠNG VÀ NGÔN NGỮ (CLEAN FORMAT & LOCALIZATION):\n"
+        "   - Trong nội dung đáp án (content của option), TUYỆT ĐỐI KHÔNG thêm chữ cái đầu dòng như 'A. ', 'B. ', 'C. ', 'D. ', '1. ', '2. '.\n"
+        "   - TUYỆT ĐỐI KHÔNG để lọt từ ngữ tiếng Trung (như '而非') hay ngôn ngữ lạ. 100% tiếng Việt tự nhiên chuẩn mực kết hợp thuật ngữ kỹ thuật tiếng Anh.\n\n"
+        "5. QUY TẮC KHÔNG TRÙNG LẶP (ANTI-REDUNDANCY):\n"
+        "   - Mỗi điểm kỹ thuật chỉ tạo 1 câu hỏi sâu sắc, độc lập (ví dụ: đúng 1 câu về Axios interceptor refresh token, 1 câu về JTI blacklist, 1 câu về Bug Story Invite). Tuyệt đối không sinh nhiều biến thể trùng lặp của cùng một câu hỏi.\n"
+        "   - CẤU TRÚC: Mỗi câu đúng 4 đáp án, duy nhất 1 đáp án có is_correct=true."
     )
 
     prompt = (
@@ -405,18 +478,47 @@ async def generate_questions_by_topics(
     # 4. Normalize, validate output and deduplicate
     validated: list[GeneratedQuestionItem] = []
     seen_contents = set()
+    existing_token_sets: list[set[str]] = []
+    concept_counts: dict[str, int] = {}
 
     for q in raw_questions:
-        c_clean = q.content.strip()
+        c_clean = clean_question_text(q.content)
+        if not c_clean or len(c_clean) < 15:
+            continue
+
+        # 4.1 Exact prefix key check
         c_key = re.sub(r"\s+", " ", c_clean.lower())[:80]
         if c_key in seen_contents:
             continue
-        seen_contents.add(c_key)
+
+        # 4.2 Semantic keyword overlap check
+        q_tokens = extract_keywords(c_clean)
+        if is_duplicate_question(q_tokens, existing_token_sets):
+            continue
+
+        # 4.3 Concept frequency capping (Max 2 questions for sensitive recurring concepts)
+        concept_hit = None
+        sensitive_concepts = [
+            "interceptor", "jti", "invite", "closestcorners",
+            "pointerwithin", "trust proxy", "touchsensor"
+        ]
+        for sc in sensitive_concepts:
+            if sc in c_clean.lower():
+                concept_hit = sc
+                break
+        if concept_hit:
+            current_count = concept_counts.get(concept_hit, 0)
+            if current_count >= 2:
+                continue
+            concept_counts[concept_hit] = current_count + 1
 
         opts = [
-            GeneratedOptionItem(content=o.content.strip(), is_correct=bool(o.is_correct))
+            GeneratedOptionItem(
+                content=clean_option_text(o.content),
+                is_correct=bool(o.is_correct),
+            )
             for o in q.options
-            if o.content.strip()
+            if clean_option_text(o.content)
         ]
         if len(opts) < 2:
             continue
@@ -428,9 +530,13 @@ async def generate_questions_by_topics(
                 for idx, o in enumerate(opts)
             ]
 
-        full_explanation = q.explanation.strip()
+        full_explanation = clean_text_noise(q.explanation)
         if q.source_reference and q.source_reference not in full_explanation:
             full_explanation = f"[Nguồn: {q.source_reference}]\n{full_explanation}"
+
+        seen_contents.add(c_key)
+        if q_tokens:
+            existing_token_sets.append(q_tokens)
 
         validated.append(
             GeneratedQuestionItem(
@@ -495,9 +601,11 @@ def _call_gemini_rag_sync(
         "QUY TẮC RAG CỐT LÕI BẮT BUỘC:\n"
         "1. GROUNDING TUYỆT ĐỐI: Tất cả câu hỏi, đáp án đúng và giải thích PHẢI BÁM SÁT 100% VÀO DỮ LIỆU CÓ TRONG <DOCUMENT_CHUNKS>.\n"
         "2. CHỈ HỎI VỀ KIẾN THỨC CHUYÊN MÔN THỰC CHẤT. TUYỆT ĐỐI KHÔNG sinh câu hỏi về lộ trình ôn tập, thời gian biểu, mục lục.\n"
-        "3. NGUỒN DẪN CHỨNG (source_reference): Mỗi câu hỏi phải ghi rõ lấy từ [Đoạn trích X: Mục ...] nào.\n"
-        "4. LỜI GIẢI THÍCH (explanation): Phải chỉ rõ vì sao đáp án đúng dựa vào trích dẫn câu chữ cụ thể trong tài liệu.\n"
-        "5. CẤU TRÚC: Mỗi câu có đúng 4 đáp án (options), trong đó DUY NHẤT 1 đáp án có is_correct=true."
+        "3. ĐÁP ÁN NHIỄU (DISTRACTORS): Các đáp án sai phải thực sự sai về mặt kỹ thuật, tuyệt đối không dùng mệnh đề vốn đúng trong thực tế làm đáp án sai.\n"
+        "4. ALIGNMENT: Hỏi về cách giải quyết/khắc phục thì đáp án phải là giải pháp, không được là nguyên nhân.\n"
+        "5. ĐỊNH DẠNG: Tuyệt đối không thêm tiền tố 'A. ', 'B. ' vào đáp án. Không để lẫn chữ Hán hay ngoại ngữ lạ.\n"
+        "6. NGUỒN DẪN CHỨNG (source_reference): Mỗi câu hỏi phải ghi rõ lấy từ [Đoạn trích X: Mục ...] nào.\n"
+        "7. CẤU TRÚC: Mỗi câu có đúng 4 đáp án (options), trong đó DUY NHẤT 1 đáp án có is_correct=true."
     )
 
     user_prompt = (
@@ -584,10 +692,16 @@ async def generate_rag_questions_from_document(
 
     validated: list[GeneratedQuestionItem] = []
     for q in raw_output.questions[:num_questions]:
+        c_clean = clean_question_text(q.content)
+        if not c_clean:
+            continue
         opts = [
-            GeneratedOptionItem(content=o.content.strip(), is_correct=bool(o.is_correct))
+            GeneratedOptionItem(
+                content=clean_option_text(o.content),
+                is_correct=bool(o.is_correct)
+            )
             for o in q.options
-            if o.content.strip()
+            if clean_option_text(o.content)
         ]
         if len(opts) < 2:
             continue
@@ -599,13 +713,13 @@ async def generate_rag_questions_from_document(
                 for idx, o in enumerate(opts)
             ]
 
-        full_explanation = q.explanation.strip()
+        full_explanation = clean_text_noise(q.explanation)
         if q.source_reference and q.source_reference not in full_explanation:
             full_explanation = f"[Nguồn: {q.source_reference}]\n{full_explanation}"
 
         validated.append(
             GeneratedQuestionItem(
-                content=q.content.strip(),
+                content=c_clean,
                 code_snippet=q.code_snippet.strip() if q.code_snippet else None,
                 code_language=q.code_language.strip() if q.code_language else None,
                 explanation=full_explanation,
