@@ -226,13 +226,16 @@ async def quick_generate_from_document(
         default_title=doc_title,
     )
 
-    # 4. Run RAG Question Generation
-    generated = await generate_questions_from_text(
+    # 4. Run Exhaustive RAG Question Generation
+    _title, all_topics = await extract_document_topics(sanitized_text)
+    generated = await generate_questions_by_topics(
         doc_text=sanitized_text,
-        num_questions=max(1, min(20, num_questions)),
-        difficulty=difficulty,
-        language=language,
+        all_topics=all_topics,
+        selected_topic_ids=["all"],
+        difficulty=difficulty or "mixed",
+        language=language or "vi",
         category_name=category.name,
+        density="exhaustive",
     )
 
     # 5. Persist to question bank if requested
@@ -489,12 +492,15 @@ async def generate_quiz_from_document(
         default_title=doc.title,
     )
 
-    generated = await generate_questions_from_text(
+    _title, all_topics = await extract_document_topics(doc.content_text)
+    generated = await generate_questions_by_topics(
         doc_text=doc.content_text,
-        num_questions=payload.num_questions,
-        difficulty=payload.difficulty,
-        language=payload.language,
+        all_topics=all_topics,
+        selected_topic_ids=["all"],
+        difficulty=payload.difficulty or "mixed",
+        language=payload.language or "vi",
         category_name=category.name if category else None,
+        density="exhaustive",
     )
 
     output_questions: list[GeneratedQuestionItem] = []

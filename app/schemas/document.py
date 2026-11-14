@@ -30,7 +30,7 @@ class DocumentResponse(BaseModel):
 
 
 class DocumentGenerateRequest(BaseModel):
-    num_questions: int = Field(default=5, ge=3, le=15)
+    num_questions: int | None = Field(default=None)
     difficulty: Literal["easy", "medium", "hard", "mixed"] = "mixed"
     language: Literal["vi", "en"] = "vi"
     category_slug: str | None = None
