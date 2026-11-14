@@ -9,7 +9,7 @@ import pymupdf
 
 from app.core.config import settings
 
-ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md"}
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".md"}
 MAX_EXTRACTED_CHARS = 150_000
 MAX_DOCX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024  # 50 MB zip-bomb guard
 
@@ -129,6 +129,41 @@ def _extract_docx(raw_bytes: bytes) -> str:
         ) from exc
 
 
+def _extract_doc(raw_bytes: bytes) -> str:
+    """Extract readable text from legacy Word .doc or binary files."""
+    if raw_bytes.startswith(b"PK\x03\x04") or raw_bytes.startswith(b"PK\x05\x06"):
+        return _extract_docx(raw_bytes)
+
+    text_chunks: list[str] = []
+    try:
+        # Extract sequences of UTF-16LE characters (Word 97-2003 storage)
+        utf16_matches = re.findall(b"(?:[\x20-\x7e\xa0-\xff]\x00){4,}", raw_bytes)
+        for m in utf16_matches:
+            try:
+                decoded = m.decode("utf-16le").strip()
+                if len(decoded) >= 4 and not decoded.startswith("Normal"):
+                    text_chunks.append(decoded)
+            except Exception:
+                pass
+
+        # Extract readable ASCII / UTF-8 text strings
+        ascii_matches = re.findall(rb"[\x20-\x7e\n\r\t]{5,}", raw_bytes)
+        for m in ascii_matches:
+            try:
+                decoded = m.decode("utf-8", errors="ignore").strip()
+                if len(decoded) >= 5 and decoded not in text_chunks:
+                    text_chunks.append(decoded)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if text_chunks:
+        return "\n".join(text_chunks)
+
+    return _extract_plain_text(raw_bytes)
+
+
 def _extract_plain_text(raw_bytes: bytes) -> str:
     if b"\x00" in raw_bytes:
         raise HTTPException(
@@ -154,7 +189,7 @@ async def parse_uploaded_document(upload: UploadFile) -> tuple[str, str, int, st
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported file type. Allowed: .pdf, .docx, .txt, .md",
+            detail="Unsupported file type. Allowed: .pdf, .docx, .doc, .txt, .md",
         )
 
     max_bytes = settings.max_upload_size_bytes
@@ -183,6 +218,8 @@ async def parse_uploaded_document(upload: UploadFile) -> tuple[str, str, int, st
         extracted = _extract_pdf(raw_bytes)
     elif ext == ".docx":
         extracted = _extract_docx(raw_bytes)
+    elif ext == ".doc":
+        extracted = _extract_doc(raw_bytes)
     else:
         extracted = _extract_plain_text(raw_bytes)
 

@@ -231,6 +231,13 @@ class QuizAttemptHistoryResponse(BaseModel):
     total: int
 
 
+class CategoryCreateRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    description: str | None = Field(default=None, max_length=500)
+    icon: str = Field(default="folder", max_length=50)
+    color: str = Field(default="#4F46E5", max_length=30)
+
+
 class CategoryResponse(BaseModel):
     id: UUID
     name: str

@@ -41,6 +41,16 @@ async def test_categories_seeded_with_8_modules(client: AsyncClient) -> None:
     not_found = await client.get("/api/v1/categories/non-existent")
     assert not_found.status_code == 404
 
+    # Test creating custom category
+    create_res = await client.post(
+        "/api/v1/categories",
+        json={"name": "Kiến trúc Transformer & LLM", "description": "Tùy chỉnh"},
+    )
+    assert create_res.status_code == 201
+    custom_cat = create_res.json()
+    assert custom_cat["name"] == "Kiến trúc Transformer & LLM"
+    assert "kien-truc-transformer" in custom_cat["slug"]
+
 
 @pytest.mark.asyncio
 async def test_question_crud_bulk_and_idor_protection(client: AsyncClient) -> None:

@@ -5,7 +5,7 @@ from app.models.quiz import Category, Question, QuestionOption, Quiz, QuizQuesti
 
 SEED_CATEGORIES = [
     {
-        "name": "Python Fundamentals",
+        "name": "Nền tảng Python",
         "slug": "python-fundamentals",
         "description": "Python nâng cao cho AI Engineer: async/await, typing, generators, memory, vectorization.",
         "icon": "code",
@@ -13,7 +13,7 @@ SEED_CATEGORIES = [
         "order_index": 1,
     },
     {
-        "name": "Math for AI",
+        "name": "Toán học cho AI",
         "slug": "math-for-ai",
         "description": "Đại số tuyến tính, giải tích ma trận, xác suất thống kê và tối ưu hóa cho Machine Learning.",
         "icon": "sigma",
@@ -21,7 +21,7 @@ SEED_CATEGORIES = [
         "order_index": 2,
     },
     {
-        "name": "Machine Learning",
+        "name": "Học máy (Machine Learning)",
         "slug": "machine-learning",
         "description": "Supervised/Unsupervised Learning, Bias-Variance, Feature Engineering, XGBoost, Evaluation.",
         "icon": "git-branch",
@@ -29,7 +29,7 @@ SEED_CATEGORIES = [
         "order_index": 3,
     },
     {
-        "name": "Deep Learning",
+        "name": "Học sâu (Deep Learning)",
         "slug": "deep-learning",
         "description": "PyTorch, Backpropagation, Normalization, Optimizers, Attention & Transformer internals.",
         "icon": "cpu",
@@ -37,7 +37,7 @@ SEED_CATEGORIES = [
         "order_index": 4,
     },
     {
-        "name": "NLP & LLM",
+        "name": "Xử lý ngôn ngữ tự nhiên & LLM",
         "slug": "nlp-llm",
         "description": "Tokenization, Embeddings, RAG, LoRA/QLoRA fine-tuning, KV Cache và Decoding strategies.",
         "icon": "message-square",
@@ -45,7 +45,7 @@ SEED_CATEGORIES = [
         "order_index": 5,
     },
     {
-        "name": "Computer Vision",
+        "name": "Thị giác máy tính (Computer Vision)",
         "slug": "computer-vision",
         "description": "CNN architectures, ViT, Object Detection, Segmentation, Multimodal Vision-Language Models.",
         "icon": "eye",
@@ -53,7 +53,7 @@ SEED_CATEGORIES = [
         "order_index": 6,
     },
     {
-        "name": "MLOps",
+        "name": "MLOps & Triển khai mô hình",
         "slug": "mlops",
         "description": "Model serving, vLLM/ONNX, Docker, CI/CD, Drift monitoring, Feature Stores & Evaluation pipelines.",
         "icon": "server",
@@ -61,7 +61,7 @@ SEED_CATEGORIES = [
         "order_index": 7,
     },
     {
-        "name": "AI Agents",
+        "name": "AI Agents & Trợ lý thông minh",
         "slug": "ai-agents",
         "description": "Tool calling, ReAct, Multi-agent orchestration, MCP, Memory, Guardrails & Agent evaluation.",
         "icon": "bot",
