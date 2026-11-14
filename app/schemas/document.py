@@ -63,3 +63,28 @@ class DocumentGenerateResponse(BaseModel):
     category_slug: str | None = None
     saved: bool
     questions: list[GeneratedQuestionItem]
+
+
+class TopicItem(BaseModel):
+    id: str
+    title: str
+    summary: str
+    key_points: list[str] = Field(default_factory=list)
+
+
+class DocumentAnalyzeResponse(BaseModel):
+    document_id: UUID
+    document_title: str
+    file_type: str
+    char_count: int
+    preview: str
+    topics: list[TopicItem]
+
+
+class TopicGenerateRequest(BaseModel):
+    document_id: UUID
+    selected_topic_ids: list[str] = Field(default_factory=lambda: ["all"])
+    difficulty: Literal["easy", "medium", "hard", "mixed"] = "mixed"
+    language: Literal["vi", "en"] = "vi"
+    category_id: UUID | None = None
+    save_to_bank: bool = True
