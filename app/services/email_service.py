@@ -1,4 +1,4 @@
-"""Transactional email service for Quizo via Brevo SMTP / Dev logger."""
+"""Transactional email service for Quizo via Brevo REST API / SMTP / Dev logger."""
 
 import asyncio
 from email.mime.multipart import MIMEMultipart
@@ -6,20 +6,62 @@ from email.mime.text import MIMEText
 import logging
 import smtplib
 
+import httpx
+
 from app.core.config import settings
 
 logger = logging.getLogger("quizo.email")
 
 
+async def _send_brevo_api(
+    to_email: str, recipient_name: str, subject: str, html_body: str, text_body: str
+) -> bool:
+    """Send transactional email via Brevo REST API v3."""
+    if not settings.BREVO_API_KEY:
+        return False
+
+    from_email = settings.SMTP_FROM_EMAIL or "noreply@quizo.app"
+    from_name = settings.SMTP_FROM_NAME or "Quizo"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.brevo.com/v3/smtp/email",
+                headers={
+                    "api-key": settings.BREVO_API_KEY,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json={
+                    "sender": {"name": from_name, "email": from_email},
+                    "to": [{"email": to_email, "name": recipient_name or to_email.split("@")[0]}],
+                    "subject": subject,
+                    "htmlContent": html_body,
+                    "textContent": text_body,
+                },
+            )
+            if resp.status_code in (200, 201, 202):
+                logger.info("Successfully sent email to %s via Brevo REST API", to_email)
+                return True
+            logger.warning(
+                "Brevo REST API returned status %s: %s",
+                resp.status_code,
+                resp.text,
+            )
+            return False
+    except Exception as exc:
+        logger.warning(
+            "Failed to send email to %s via Brevo REST API (%s: %s)",
+            to_email,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
 def _send_smtp_sync(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
     """Synchronous SMTP sender run inside asyncio.to_thread."""
     if not settings.SMTP_SERVER or not settings.SMTP_PASSWORD:
-        logger.info(
-            "[DEV EMAIL] No SMTP credentials configured. Email to <%s> logged:\nSubject: %s\n%s",
-            to_email,
-            subject,
-            text_body,
-        )
         return False
 
     msg = MIMEMultipart("alternative")
@@ -44,14 +86,42 @@ def _send_smtp_sync(to_email: str, subject: str, html_body: str, text_body: str)
         return True
     except Exception as exc:
         logger.warning(
-            "Failed to send email to %s via Brevo SMTP (%s: %s). "
-            "Logging action link for local testing:\n%s",
+            "Failed to send email to %s via Brevo SMTP (%s: %s).",
             to_email,
             type(exc).__name__,
             exc,
-            text_body,
         )
         return False
+
+
+async def _dispatch_email(
+    to_email: str,
+    recipient_name: str,
+    subject: str,
+    html_body: str,
+    text_body: str,
+) -> bool:
+    """Multi-tiered transactional email dispatch (Brevo REST API -> SMTP -> Dev Logger)."""
+    # 1. Primary: Brevo REST API v3
+    if settings.BREVO_API_KEY:
+        sent = await _send_brevo_api(to_email, recipient_name, subject, html_body, text_body)
+        if sent:
+            return True
+
+    # 2. Secondary: Standard SMTP
+    if settings.SMTP_SERVER and settings.SMTP_PASSWORD:
+        sent = await asyncio.to_thread(_send_smtp_sync, to_email, subject, html_body, text_body)
+        if sent:
+            return True
+
+    # 3. Fallback: Dev console logger
+    logger.info(
+        "[DEV EMAIL] Email to <%s> logged:\nSubject: %s\n%s",
+        to_email,
+        subject,
+        text_body,
+    )
+    return False
 
 
 async def send_verification_email(email: str, full_name: str, token: str) -> None:
@@ -110,7 +180,7 @@ Trân trọng,
 </body>
 </html>"""
 
-    await asyncio.to_thread(_send_smtp_sync, email, subject, html_body, text_body)
+    await _dispatch_email(email, full_name, subject, html_body, text_body)
 
 
 async def send_password_reset_email(email: str, full_name: str, token: str) -> None:
@@ -169,4 +239,4 @@ Trân trọng,
 </body>
 </html>"""
 
-    await asyncio.to_thread(_send_smtp_sync, email, subject, html_body, text_body)
+    await _dispatch_email(email, full_name, subject, html_body, text_body)
