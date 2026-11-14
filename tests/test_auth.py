@@ -37,6 +37,17 @@ async def test_register_login_me_and_password_policy(client: AsyncClient) -> Non
     assert reg_data["user"]["auth_provider"] == "local"
     assert "hashed_password" not in reg_data["user"]
 
+    # Registration without full_name succeeds and defaults to email prefix
+    no_name_res = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "nameless@example.com",
+            "password": "StrongPassword123",
+        },
+    )
+    assert no_name_res.status_code == 201
+    assert no_name_res.json()["user"]["full_name"] == "nameless"
+
     # Duplicate email rejected (case-insensitive)
     dup_res = await client.post(
         "/api/v1/auth/register",
