@@ -50,7 +50,7 @@ async def _issue_token_pair(db: AsyncSession, user: User) -> tuple[str, str]:
 
 
 async def register_user(
-    db: AsyncSession, email: str, password: str, full_name: str
+    db: AsyncSession, email: str, password: str, full_name: str | None = None
 ) -> tuple[User, str, str]:
     normalized_email = email.strip().lower()
     existing = await db.scalar(select(User).where(User.email == normalized_email))
@@ -60,9 +60,11 @@ async def register_user(
             detail="Email is already registered.",
         )
 
+    resolved_name = (full_name or "").strip() or normalized_email.split("@")[0][:120]
+
     user = User(
         email=normalized_email,
-        full_name=full_name.strip(),
+        full_name=resolved_name,
         hashed_password=hash_password(password),
         auth_provider="local",
         is_verified=False,

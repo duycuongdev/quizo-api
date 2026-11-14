@@ -9,15 +9,15 @@ from app.core.security import validate_password_strength
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
-    full_name: str = Field(min_length=1, max_length=120)
+    full_name: str | None = Field(default=None, max_length=120)
 
     @field_validator("full_name")
     @classmethod
-    def clean_full_name(cls, value: str) -> str:
+    def clean_full_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("Full name cannot be empty.")
-        return cleaned
+        return cleaned or None
 
     @field_validator("password")
     @classmethod
